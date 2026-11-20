@@ -1,18 +1,30 @@
 package com.example.ztemanager.network
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.ConnectionSpec
 import okhttp3.Cookie
 import okhttp3.CookieJar
 import okhttp3.FormBody
 import okhttp3.HttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.TlsVersion
+import java.net.InetAddress
+import java.net.Socket
 import java.security.MessageDigest
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
+import java.util.Locale
 import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLSocket
+import javax.net.ssl.SSLSocketFactory
+import javax.net.ssl.X509TrustManager
 
 enum class LogType { SYS, OK, ERR, WARN, ACT }
 
@@ -43,11 +55,79 @@ class ZteRouterClient(
 ) {
     private val cookieStore = mutableMapOf<String, MutableList<Cookie>>()
     private var baseUrl: String = "http://192.168.1.1"
+    private var targetHost: String = "192.168.1.1"
+
+    private class LegacyTlsSocketFactory(
+        private val delegate: SSLSocketFactory
+    ) : SSLSocketFactory() {
+
+        override fun getDefaultCipherSuites(): Array<String> = delegate.defaultCipherSuites
+        override fun getSupportedCipherSuites(): Array<String> = delegate.supportedCipherSuites
+
+        override fun createSocket(): Socket = patch(delegate.createSocket())
+        override fun createSocket(s: Socket, host: String, port: Int, autoClose: Boolean): Socket =
+            patch(delegate.createSocket(s, host, port, autoClose))
+        override fun createSocket(host: String, port: Int): Socket =
+            patch(delegate.createSocket(host, port))
+        override fun createSocket(host: String, port: Int, localHost: InetAddress, localPort: Int): Socket =
+            patch(delegate.createSocket(host, port, localHost, localPort))
+        override fun createSocket(host: InetAddress, port: Int): Socket =
+            patch(delegate.createSocket(host, port))
+        override fun createSocket(address: InetAddress, port: Int, localAddress: InetAddress, localPort: Int): Socket =
+            patch(delegate.createSocket(address, port, localAddress, localPort))
+
+        private fun patch(socket: Socket): Socket {
+            if (socket is SSLSocket) {
+                val wanted = setOf("TLSv1.3", "TLSv1.2", "TLSv1.1", "TLSv1")
+                val enabled = socket.supportedProtocols.filter { it in wanted }.toTypedArray()
+                if (enabled.isNotEmpty()) {
+                    socket.enabledProtocols = enabled
+                }
+                val suites = socket.supportedCipherSuites
+                    .filterNot { it == "TLS_FALLBACK_SCSV" }
+                    .toTypedArray()
+                if (suites.isNotEmpty()) {
+                    socket.enabledCipherSuites = suites
+                }
+            }
+            return socket
+        }
+    }
 
     private fun buildClient(): OkHttpClient {
+        @SuppressLint("CustomX509TrustManager")
+        val localTrustManager = object : X509TrustManager {
+            @SuppressLint("TrustAllX509TrustManager")
+            override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {}
+            @SuppressLint("TrustAllX509TrustManager")
+            override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {}
+            override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+        }
+
+        val sslContext = SSLContext.getInstance("TLS").apply {
+            init(null, arrayOf(localTrustManager), SecureRandom())
+        }
+
+        val legacyTlsSpec = ConnectionSpec.Builder(ConnectionSpec.COMPATIBLE_TLS)
+            .tlsVersions(
+                TlsVersion.TLS_1_3,
+                TlsVersion.TLS_1_2,
+                TlsVersion.TLS_1_1,
+                TlsVersion.TLS_1_0
+            )
+            .allEnabledCipherSuites()
+            .build()
+
         val builder = OkHttpClient.Builder()
-            .connectTimeout(8, TimeUnit.SECONDS)
-            .readTimeout(10, TimeUnit.SECONDS)
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(12, TimeUnit.SECONDS)
+            .connectionSpecs(listOf(legacyTlsSpec, ConnectionSpec.CLEARTEXT))
+            .sslSocketFactory(LegacyTlsSocketFactory(sslContext.socketFactory), localTrustManager)
+            .hostnameVerifier { hostname, _ ->
+                hostname == targetHost ||
+                    hostname.startsWith("192.168.") ||
+                    hostname.startsWith("10.")
+            }
             .cookieJar(object : CookieJar {
                 override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
                     val list = cookieStore.getOrPut(url.host) { mutableListOf() }
@@ -72,7 +152,6 @@ class ZteRouterClient(
                 }
             })
 
-        // توجيه الاتصال عبر شبكة الواي فاي مباشرة لضمان الوصول إلى 192.168.1.1
         try {
             val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
             val wifiNetwork = cm.allNetworks.firstOrNull { net ->
@@ -90,8 +169,14 @@ class ZteRouterClient(
     private var client: OkHttpClient = buildClient()
 
     fun setRouterIp(ip: String) {
-        val clean = ip.trim().removePrefix("http://").removePrefix("https://").trimEnd('/')
-        baseUrl = "http://$clean"
+        val trimmed = ip.trim().trimEnd('/')
+        val hasHttps = trimmed.startsWith("https://", ignoreCase = true)
+        val cleanHost = trimmed
+            .removePrefix("http://")
+            .removePrefix("https://")
+            .substringBefore("/")
+        targetHost = cleanHost.substringBefore(":")
+        baseUrl = if (hasHttps) "https://$cleanHost" else "http://$cleanHost"
     }
 
     fun clearSession() {
@@ -108,7 +193,20 @@ class ZteRouterClient(
                 onLog("HANDSHAKE -> GET $baseUrl/", LogType.SYS)
 
                 val initReq = Request.Builder().url("$baseUrl/").get().build()
-                val initHtml = client.newCall(initReq).execute().use { it.body?.string() ?: "" }
+                val initHtml = client.newCall(initReq).execute().use { resp ->
+                    val finalUrl = resp.request.url
+                    val portPart = if (
+                        (finalUrl.scheme == "http" && finalUrl.port != 80) ||
+                        (finalUrl.scheme == "https" && finalUrl.port != 443)
+                    ) ":${finalUrl.port}" else ""
+                    val resolvedBase = "${finalUrl.scheme}://${finalUrl.host}$portPart"
+                    if (resolvedBase != baseUrl) {
+                        baseUrl = resolvedBase
+                        targetHost = finalUrl.host
+                        onLog("REDIRECTED -> $baseUrl (LEGACY TLS OK)", LogType.ACT)
+                    }
+                    resp.body?.string() ?: ""
+                }
 
                 if (initHtml.isEmpty()) {
                     onLog("EMPTY RESPONSE FROM ROUTER", LogType.ERR)
@@ -121,7 +219,10 @@ class ZteRouterClient(
                         .find(initHtml)?.groupValues?.get(1)
                     ?: ""
 
-                onLog("EXTRACTED LOGIN TOKEN: ${if (loginToken.isEmpty()) "NONE" else loginToken}", LogType.SYS)
+                onLog(
+                    "EXTRACTED LOGIN TOKEN: ${if (loginToken.isEmpty()) "NONE" else loginToken}",
+                    LogType.SYS
+                )
 
                 val usesSha256 = initHtml.contains("sha256", ignoreCase = true)
                 val randomNum = if (usesSha256) (10000000..99999999).random().toString() else ""
@@ -148,8 +249,8 @@ class ZteRouterClient(
 
                 val responseHtml = client.newCall(loginReq).execute().use { it.body?.string() ?: "" }
                 val success = responseHtml.isNotEmpty() &&
-                        !responseHtml.contains("Frm_Logintoken") &&
-                        !responseHtml.contains("Password is wrong", ignoreCase = true)
+                    !responseHtml.contains("Frm_Logintoken") &&
+                    !responseHtml.contains("Password is wrong", ignoreCase = true)
 
                 if (success) {
                     onLog("AUTH SUCCESS -> SESSION ESTABLISHED", LogType.OK)
@@ -196,7 +297,9 @@ class ZteRouterClient(
             val map = parseTransferMeaning(html)
 
             val indices = map.keys
-                .mapNotNull { Regex("""^(?:MACAddr|IPAddr)(\d+)$""").find(it)?.groupValues?.get(1)?.toIntOrNull() }
+                .mapNotNull {
+                    Regex("""^(?:MACAddr|IPAddr)(\d+)$""").find(it)?.groupValues?.get(1)?.toIntOrNull()
+                }
                 .distinct()
                 .sorted()
 
@@ -247,7 +350,10 @@ class ZteRouterClient(
                 .build()
 
             val ok = client.newCall(req).execute().use { it.isSuccessful }
-            onLog(if (ok) "MAC RULE SENT SUCCESSFULLY" else "MAC RULE FAILED", if (ok) LogType.OK else LogType.ERR)
+            onLog(
+                if (ok) "MAC RULE SENT SUCCESSFULLY" else "MAC RULE FAILED",
+                if (ok) LogType.OK else LogType.ERR
+            )
             ok
         } catch (e: Exception) {
             onLog("MAC BLOCK ERR: ${e.message}", LogType.ERR)
@@ -280,7 +386,10 @@ class ZteRouterClient(
                 .build()
 
             val ok = client.newCall(req).execute().use { it.isSuccessful }
-            onLog(if (ok) "REBOOT COMMAND TRANSMITTED" else "REBOOT REJECTED", if (ok) LogType.OK else LogType.ERR)
+            onLog(
+                if (ok) "REBOOT COMMAND TRANSMITTED" else "REBOOT REJECTED",
+                if (ok) LogType.OK else LogType.ERR
+            )
             ok
         } catch (e: Exception) {
             onLog("REBOOT ERR: ${e.message}", LogType.ERR)
@@ -319,7 +428,7 @@ class ZteRouterClient(
 
     private fun formatTenths(raw: String?): String {
         val num = raw?.toDoubleOrNull() ?: return "--"
-        return String.format("%.1f dB", num / 10.0)
+        return String.format(Locale.US, "%.1f dB", num / 10.0)
     }
 
     private fun sha256(input: String): String {
