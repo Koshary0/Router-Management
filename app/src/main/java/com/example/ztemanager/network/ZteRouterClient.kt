@@ -15,10 +15,13 @@ import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.TlsVersion
+import org.bouncycastle.jce.provider.BouncyCastleProvider
+import org.bouncycastle.jsse.provider.BouncyCastleJsseProvider
 import java.net.InetAddress
 import java.net.Socket
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.security.Security
 import java.security.cert.X509Certificate
 import java.util.Locale
 import java.util.concurrent.TimeUnit
@@ -32,27 +35,31 @@ enum class LogType { SYS, OK, ERR, WARN, ACT }
 private enum class TlsMode(
     val label: String,
     val okHttpVersions: Array<TlsVersion>,
-    val socketProtocols: Set<String>
+    val socketProtocols: Set<String>,
+    val compactLegacySuites: Boolean = false
 ) {
-    NO_TLS13(
-        "TLS 1.2 / 1.1 / 1.0 (No TLS 1.3)",
-        arrayOf(TlsVersion.TLS_1_2, TlsVersion.TLS_1_1, TlsVersion.TLS_1_0),
-        setOf("TLSv1.2", "TLSv1.1", "TLSv1")
-    ),
-    TLS10_ONLY(
-        "TLS 1.0 Only",
+    TLS10_COMPACT(
+        "BC TLS 1.0 (Compact Legacy)",
         arrayOf(TlsVersion.TLS_1_0),
-        setOf("TLSv1")
+        setOf("TLSv1"),
+        compactLegacySuites = true
     ),
-    SSLV3_AND_TLS10(
-        "SSLv3 + TLS 1.0",
-        arrayOf(TlsVersion.TLS_1_0, TlsVersion.SSL_3_0),
-        setOf("TLSv1", "SSLv3")
+    TLS10_ALL(
+        "BC TLS 1.0 (All Ciphers)",
+        arrayOf(TlsVersion.TLS_1_0),
+        setOf("TLSv1"),
+        compactLegacySuites = false
+    ),
+    TLS_MULTI(
+        "BC TLS 1.0 / 1.1 / 1.2",
+        arrayOf(TlsVersion.TLS_1_2, TlsVersion.TLS_1_1, TlsVersion.TLS_1_0),
+        setOf("TLSv1.2", "TLSv1.1", "TLSv1"),
+        compactLegacySuites = false
     )
 }
 
 data class DslStats(
-    val status: String = "غير معروف",
+    val status: String = "Unknown",
     val downRateKbps: String = "--",
     val upRateKbps: String = "--",
     val maxDownKbps: String = "--",
@@ -80,9 +87,30 @@ class ZteRouterClient(
     private var baseUrl: String = "http://192.168.1.1"
     private var targetHost: String = "192.168.1.1"
 
-    private class LegacyTlsSocketFactory(
+    private val bcJsseProvider: BouncyCastleJsseProvider by lazy {
+        try {
+            Security.setProperty("jdk.tls.disabledAlgorithms", "")
+            Security.setProperty("jdk.certpath.disabledAlgorithms", "")
+        } catch (_: Exception) {
+        }
+        BouncyCastleJsseProvider(BouncyCastleProvider())
+    }
+
+    private val legacyClassicSuites = listOf(
+        "TLS_RSA_WITH_AES_128_CBC_SHA",
+        "TLS_RSA_WITH_AES_256_CBC_SHA",
+        "TLS_RSA_WITH_3DES_EDE_CBC_SHA",
+        "TLS_DHE_RSA_WITH_AES_128_CBC_SHA",
+        "TLS_DHE_RSA_WITH_AES_256_CBC_SHA",
+        "TLS_DHE_RSA_WITH_3DES_EDE_CBC_SHA",
+        "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
+        "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA"
+    )
+
+    private class BcTlsSocketFactory(
         private val delegate: SSLSocketFactory,
-        private val allowedProtocols: Set<String>
+        private val allowedProtocols: Set<String>,
+        private val preferredSuites: List<String>?
     ) : SSLSocketFactory() {
 
         override fun getDefaultCipherSuites(): Array<String> = delegate.defaultCipherSuites
@@ -106,12 +134,18 @@ class ZteRouterClient(
                 if (enabled.isNotEmpty()) {
                     socket.enabledProtocols = enabled
                 }
-                val suites = socket.supportedCipherSuites
-                    .filterNot { it == "TLS_FALLBACK_SCSV" }
-                    .toTypedArray()
-                if (suites.isNotEmpty()) {
-                    socket.enabledCipherSuites = suites
+
+                val supported = socket.supportedCipherSuites.toSet()
+                val chosen = if (preferredSuites != null) {
+                    val matched = preferredSuites.filter { it in supported }
+                    if (matched.isNotEmpty()) matched.toTypedArray() else null
+                } else {
+                    null
                 }
+
+                socket.enabledCipherSuites = chosen ?: socket.supportedCipherSuites
+                    .filterNot { it.contains("SCSV") || it.contains("NULL") || it.contains("anon") }
+                    .toTypedArray()
             }
             return socket
         }
@@ -127,7 +161,7 @@ class ZteRouterClient(
             override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
         }
 
-        val sslContext = SSLContext.getInstance("TLS").apply {
+        val sslContext = SSLContext.getInstance("TLS", bcJsseProvider).apply {
             init(null, arrayOf(localTrustManager), SecureRandom())
         }
 
@@ -137,14 +171,18 @@ class ZteRouterClient(
             .build()
 
         val builder = OkHttpClient.Builder()
-            .connectTimeout(8, TimeUnit.SECONDS)
-            .readTimeout(10, TimeUnit.SECONDS)
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(12, TimeUnit.SECONDS)
             .protocols(listOf(Protocol.HTTP_1_1))
             .followRedirects(followRedirects)
             .followSslRedirects(followRedirects)
             .connectionSpecs(listOf(tlsSpec, ConnectionSpec.CLEARTEXT))
             .sslSocketFactory(
-                LegacyTlsSocketFactory(sslContext.socketFactory, mode.socketProtocols),
+                BcTlsSocketFactory(
+                    delegate = sslContext.socketFactory,
+                    allowedProtocols = mode.socketProtocols,
+                    preferredSuites = if (mode.compactLegacySuites) legacyClassicSuites else null
+                ),
                 localTrustManager
             )
             .hostnameVerifier { hostname, _ ->
@@ -190,7 +228,7 @@ class ZteRouterClient(
         return builder.build()
     }
 
-    private var client: OkHttpClient = buildClient(TlsMode.NO_TLS13)
+    private var client: OkHttpClient = buildClient(TlsMode.TLS10_COMPACT)
 
     fun setRouterIp(ip: String) {
         val trimmed = ip.trim().trimEnd('/')
@@ -217,14 +255,16 @@ class ZteRouterClient(
                 var initHtml = ""
                 var needsHttpsProbe = baseUrl.startsWith("https://")
 
-                // 1. فحص الاتصال الأولي بدون تحويل تلقائي لمعرفة رد الراوتر الحقيقي
                 if (!needsHttpsProbe) {
                     onLog("PROBE -> GET $baseUrl/ (NO-REDIRECT)", LogType.SYS)
-                    val probeClient = buildClient(TlsMode.NO_TLS13, followRedirects = false)
+                    val probeClient = buildClient(TlsMode.TLS10_COMPACT, followRedirects = false)
                     val probeReq = Request.Builder().url("$baseUrl/").get().build()
                     probeClient.newCall(probeReq).execute().use { resp ->
                         val location = resp.header("Location")
-                        onLog("HTTP ${resp.code}${if (location != null) " -> Location: $location" else ""}", LogType.ACT)
+                        onLog(
+                            "HTTP ${resp.code}${if (location != null) " -> Location: $location" else ""}",
+                            LogType.ACT
+                        )
                         if (resp.code in 300..399 && location != null) {
                             if (location.startsWith("https://", ignoreCase = true)) {
                                 needsHttpsProbe = true
@@ -232,25 +272,26 @@ class ZteRouterClient(
                                 baseUrl = "https://$cleanTarget"
                                 targetHost = cleanTarget.substringBefore(":")
                             } else {
-                                client = buildClient(TlsMode.NO_TLS13, followRedirects = true)
+                                client = buildClient(TlsMode.TLS10_COMPACT, followRedirects = true)
                                 initHtml = client.newCall(Request.Builder().url("$baseUrl/").get().build())
                                     .execute().use { it.body?.string() ?: "" }
                             }
                         } else {
-                            client = buildClient(TlsMode.NO_TLS13, followRedirects = true)
+                            client = buildClient(TlsMode.TLS10_COMPACT, followRedirects = true)
                             initHtml = resp.body?.string() ?: ""
                         }
                     }
                 }
 
-                // 2. إذا فرض الراوتر HTTPS، نجرب أوضاع TLS القديمة بالتدريج
                 if (needsHttpsProbe) {
-                    val supported = try {
-                        SSLContext.getDefault().supportedSSLParameters.protocols.joinToString(", ")
-                    } catch (_: Exception) {
-                        "unknown"
+                    val bcProtocols = try {
+                        SSLContext.getInstance("TLS", bcJsseProvider)
+                            .apply { init(null, null, SecureRandom()) }
+                            .supportedSSLParameters.protocols.joinToString(", ")
+                    } catch (e: Exception) {
+                        "err: ${e.message}"
                     }
-                    onLog("PHONE TLS SUPPORT: [$supported]", LogType.SYS)
+                    onLog("BCTLS ENGINE PROTOCOLS: [$bcProtocols]", LogType.SYS)
 
                     var lastErr: String? = null
                     for (mode in TlsMode.entries) {
@@ -272,7 +313,7 @@ class ZteRouterClient(
                     }
 
                     if (initHtml.isEmpty()) {
-                        onLog("ALL TLS MODES FAILED -> ROUTER LIKELY USES SSLv3 OR BLOCKED CIPHER ($lastErr)", LogType.ERR)
+                        onLog("ALL BCTLS MODES FAILED: $lastErr", LogType.ERR)
                         return@withContext false
                     }
                 }
@@ -377,7 +418,7 @@ class ZteRouterClient(
                 val ip = map["IPAddr$idx"].orEmpty()
                 if (mac.isBlank() && ip.isBlank()) return@mapNotNull null
                 ConnectedDevice(
-                    hostName = map["HostName$idx"]?.ifBlank { "جهاز غير مسمى" } ?: "جهاز غير مسمى",
+                    hostName = map["HostName$idx"]?.ifBlank { "Unnamed Device" } ?: "Unnamed Device",
                     ipAddress = ip.ifBlank { "--" },
                     macAddress = mac.ifBlank { "--" },
                     leaseTime = map["ExpiredTime$idx"]?.let { "${it}s" } ?: "--"

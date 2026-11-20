@@ -29,13 +29,11 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -62,9 +60,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             ZteStudioTheme {
-                CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
-                    RouterStudioApp()
-                }
+                RouterStudioApp()
             }
         }
     }
@@ -76,10 +72,10 @@ fun RouterStudioApp() {
     val scope = rememberCoroutineScope()
     val prefs = remember { context.getSharedPreferences("zte_router_prefs", Context.MODE_PRIVATE) }
 
-    var activeTab by remember { mutableIntStateOf(3) } // يبدأ بتبويب الإعدادات مثل التصميم المرفق
+    var activeTab by remember { mutableIntStateOf(3) }
     var isConnected by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(false) }
-    var loaderMessage by remember { mutableStateOf("جاري الاتصال بالراوتر...") }
+    var loaderMessage by remember { mutableStateOf("Connecting to Gateway...") }
 
     var routerIp by remember { mutableStateOf(prefs.getString("ip", "192.168.1.1") ?: "192.168.1.1") }
     var username by remember { mutableStateOf(prefs.getString("user", "admin") ?: "admin") }
@@ -104,7 +100,6 @@ fun RouterStudioApp() {
         }
     }
 
-    // عداد مدة الجلسة النشطة
     LaunchedEffect(isConnected) {
         if (isConnected) {
             sessionSeconds = 0L
@@ -131,11 +126,11 @@ fun RouterStudioApp() {
                 .apply()
 
             isLoading = true
-            loaderMessage = "جاري المصادقة مع ZXHN H108N V2.5..."
+            loaderMessage = "Authenticating with ZXHN H108N V2.5..."
             val ok = routerClient.login(routerIp, username, password)
             if (ok) {
                 isConnected = true
-                loaderMessage = "جاري قراءة بيانات الخط والأجهزة..."
+                loaderMessage = "Syncing DSL Telemetry & DHCP..."
                 dslStats = routerClient.getDslStats()
                 devices = routerClient.getConnectedDevices()
                 activeTab = 0
@@ -152,7 +147,6 @@ fun RouterStudioApp() {
             .background(BgBase)
             .systemBarsPadding()
     ) {
-        // محتوى التبويب النشط
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -167,7 +161,7 @@ fun RouterStudioApp() {
                     onRefresh = {
                         scope.launch {
                             isLoading = true
-                            loaderMessage = "تحديث بيانات خط الـ DSL..."
+                            loaderMessage = "Refreshing DSL telemetry..."
                             dslStats = routerClient.getDslStats()
                             isLoading = false
                         }
@@ -179,7 +173,7 @@ fun RouterStudioApp() {
                     onRefresh = {
                         scope.launch {
                             isLoading = true
-                            loaderMessage = "فحص الأجهزة المتصلة..."
+                            loaderMessage = "Scanning connected devices..."
                             devices = routerClient.getConnectedDevices()
                             isLoading = false
                         }
@@ -194,7 +188,7 @@ fun RouterStudioApp() {
                             addLog("NO CACHED KEYS YET - CONNECT FIRST", LogType.WARN)
                         } else {
                             addLog("--- RAW DSL KEYS (${dslStats.rawMap.size}) ---", LogType.ACT)
-                            dslStats.rawMap.entries.take(25).forEach { (k, v) ->
+                            dslStats.rawMap.entries.take(30).forEach { (k, v) ->
                                 addLog("$k = $v", LogType.SYS)
                             }
                         }
@@ -220,7 +214,6 @@ fun RouterStudioApp() {
             }
         }
 
-        // الشريط السفلي العائم (Floating Bottom Nav)
         FloatingBottomNav(
             activeTab = activeTab,
             onTabSelected = { activeTab = it },
@@ -230,7 +223,6 @@ fun RouterStudioApp() {
                 .fillMaxWidth(0.92f)
         )
 
-        // شاشة التحميل الكاملة (Boot Loader)
         if (isLoading) {
             Box(
                 modifier = Modifier
@@ -258,7 +250,6 @@ fun RouterStudioApp() {
         }
     }
 
-    // نافذة تفاصيل الجهاز وحظره (Modal)
     selectedDevice?.let { dev ->
         DeviceActionModal(
             device = dev,
@@ -267,7 +258,7 @@ fun RouterStudioApp() {
                 scope.launch {
                     selectedDevice = null
                     isLoading = true
-                    loaderMessage = "جاري إرسال قاعدة حظر MAC..."
+                    loaderMessage = "Sending MAC filter block rule..."
                     routerClient.blockMacAddress(dev.macAddress, dev.hostName)
                     isLoading = false
                 }
@@ -275,14 +266,13 @@ fun RouterStudioApp() {
         )
     }
 
-    // نافذة تأكيد إعادة تشغيل الراوتر
     if (showRebootConfirm) {
         Dialog(onDismissRequest = { showRebootConfirm = false }) {
             StudioCard(cornerRadius = 24.dp) {
-                Text("إعادة تشغيل الراوتر", color = TextMain, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Text("Reboot Router", color = TextMain, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    "سيتم قطع الاتصال بالإنترنت لمدة دقيقة تقريباً حتى يعيد الراوتر التشغيل.",
+                    "Internet connection will drop for about 1 minute while the router restarts.",
                     color = TextMuted,
                     fontSize = 13.sp,
                     lineHeight = 20.sp
@@ -290,20 +280,20 @@ fun RouterStudioApp() {
                 Spacer(Modifier.height(18.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     StudioButton(
-                        text = "إلغاء",
+                        text = "Cancel",
                         bgColor = Surface2,
                         modifier = Modifier.weight(1f),
                         onClick = { showRebootConfirm = false }
                     )
                     StudioButton(
-                        text = "تأكيد التشغيل",
+                        text = "Reboot Now",
                         bgColor = StatusDnd,
                         modifier = Modifier.weight(1f),
                         onClick = {
                             showRebootConfirm = false
                             scope.launch {
                                 isLoading = true
-                                loaderMessage = "جاري إرسال أمر إعادة التشغيل..."
+                                loaderMessage = "Transmitting reboot command..."
                                 val ok = routerClient.rebootRouter()
                                 if (ok) isConnected = false
                                 isLoading = false
@@ -316,7 +306,7 @@ fun RouterStudioApp() {
     }
 }
 
-// ======================= تبويب 1: حالة الراوتر =======================
+// ======================= Tab 1: Router Status =======================
 @Composable
 fun RouterStatusTab(
     isConnected: Boolean,
@@ -332,7 +322,6 @@ fun RouterStatusTab(
             .padding(bottom = 105.dp),
         verticalArrangement = Arrangement.spacedBy(15.dp)
     ) {
-        // بطاقة الهيرو المتدرجة
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -359,7 +348,7 @@ fun RouterStatusTab(
                             imageVector = Icons.Rounded.Home,
                             contentDescription = null,
                             tint = if (isConnected) Accent else TextMuted,
-                            modifier = Modifier.size(46.dp)
+                            modifier = Modifier.size(44.dp)
                         )
                     }
                     Box(
@@ -373,7 +362,7 @@ fun RouterStatusTab(
 
                 Spacer(Modifier.height(14.dp))
                 Text(
-                    text = if (isConnected) "ZXHN H108N V2.5" else "غير متصل",
+                    text = if (isConnected) "ZXHN H108N V2.5" else "Disconnected",
                     color = TextMain,
                     fontSize = 22.sp,
                     fontWeight = FontWeight.ExtraBold
@@ -410,11 +399,10 @@ fun RouterStatusTab(
             }
 
             if (!isConnected) {
-                OverlayBlocker("اتصل بالراوتر من الإعدادات أولاً")
+                OverlayBlocker("Connect to router first")
             }
         }
 
-        // بطاقة قراءات خط الإنترنت (DSL Telemetry)
         Box(modifier = Modifier.fillMaxWidth()) {
             StudioCard {
                 Row(
@@ -422,7 +410,7 @@ fun RouterStatusTab(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("قراءات خط الإنترنت (DSL)", color = TextMain, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Text("DSL Line Telemetry", color = TextMain, fontSize = 16.sp, fontWeight = FontWeight.Bold)
                     Text(
                         text = stats.status,
                         color = if (isConnected) StatusOnline else TextMuted,
@@ -434,26 +422,26 @@ fun RouterStatusTab(
                 Spacer(Modifier.height(14.dp))
 
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    StatCell("سرعة التحميل", "${stats.downRateKbps} Kbps", Accent, Modifier.weight(1f))
-                    StatCell("سرعة الرفع", "${stats.upRateKbps} Kbps", StatusOnline, Modifier.weight(1f))
+                    StatCell("DOWNSTREAM", "${stats.downRateKbps} Kbps", Accent, Modifier.weight(1f))
+                    StatCell("UPSTREAM", "${stats.upRateKbps} Kbps", StatusOnline, Modifier.weight(1f))
                 }
                 Spacer(Modifier.height(10.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    StatCell("التشويش (Down SNR)", stats.downSnrDb, StatusIdle, Modifier.weight(1f))
-                    StatCell("التشويش (Up SNR)", stats.upSnrDb, StatusIdle, Modifier.weight(1f))
+                    StatCell("DOWN SNR", stats.downSnrDb, StatusIdle, Modifier.weight(1f))
+                    StatCell("UP SNR", stats.upSnrDb, StatusIdle, Modifier.weight(1f))
                 }
                 Spacer(Modifier.height(10.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    StatCell("أقصى تحميل محتمل", "${stats.maxDownKbps} Kbps", TextMain, Modifier.weight(1f))
-                    StatCell("التوهين (Attn Down)", stats.downAttnDb, TextMuted, Modifier.weight(1f))
+                    StatCell("MAX DOWN RATE", "${stats.maxDownKbps} Kbps", TextMain, Modifier.weight(1f))
+                    StatCell("DOWN ATTENUATION", stats.downAttnDb, TextMuted, Modifier.weight(1f))
                 }
 
                 Spacer(Modifier.height(16.dp))
-                StudioButton(text = "تحديث قراءات الخط", bgColor = Accent, onClick = onRefresh)
+                StudioButton(text = "Refresh Telemetry", bgColor = Accent, onClick = onRefresh)
             }
 
             if (!isConnected) {
-                OverlayBlocker("يتطلب الاتصال بالراوتر")
+                OverlayBlocker("Requires Connection")
             }
         }
     }
@@ -468,13 +456,13 @@ fun StatCell(label: String, value: String, valueColor: Color, modifier: Modifier
             .border(1.dp, BorderColor, RoundedCornerShape(12.dp))
             .padding(12.dp)
     ) {
-        Text(label, color = TextMuted, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+        Text(label, color = TextMuted, fontSize = 10.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(4.dp))
         Text(value, color = valueColor, fontSize = 14.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
     }
 }
 
-// ======================= تبويب 2: الأجهزة المتصلة =======================
+// ======================= Tab 2: Connected Devices =======================
 @Composable
 fun DevicesTab(
     isConnected: Boolean,
@@ -495,8 +483,8 @@ fun DevicesTab(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Column {
-                    Text("الأجهزة المتصلة (DHCP)", color = TextMain, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                    Text("العدد الحالي: ${devices.size} جهاز", color = TextMuted, fontSize = 12.sp)
+                    Text("Connected Devices (DHCP)", color = TextMain, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Text("Active clients: ${devices.size}", color = TextMuted, fontSize = 12.sp)
                 }
                 IconButton(
                     onClick = onRefresh,
@@ -506,7 +494,7 @@ fun DevicesTab(
                         .background(Surface2)
                         .border(1.dp, BorderColor, RoundedCornerShape(12.dp))
                 ) {
-                    Icon(Icons.Rounded.Refresh, contentDescription = null, tint = if (isConnected) Accent else TextMuted)
+                    Icon(Icons.Rounded.Refresh, contentDescription = "Refresh", tint = if (isConnected) Accent else TextMuted)
                 }
             }
         }
@@ -522,7 +510,7 @@ fun DevicesTab(
             if (devices.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Text(
-                        text = if (isConnected) "لم يتم العثور على أجهزة، اضغط تحديث" else "اتصل بالراوتر لعرض الأجهزة",
+                        text = if (isConnected) "No devices found. Tap Refresh." else "Connect to router to scan devices.",
                         color = TextMuted,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.SemiBold
@@ -567,7 +555,7 @@ fun DevicesTab(
     }
 }
 
-// ======================= تبويب 3: الطرفية (Terminal) =======================
+// ======================= Tab 3: Terminal =======================
 @Composable
 fun TerminalTab(
     logs: List<TerminalEntry>,
@@ -588,64 +576,62 @@ fun TerminalTab(
     ) {
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             StudioButton(
-                text = "فحص مفاتيح الراوتر",
+                text = "Dump DSL Keys",
                 bgColor = Surface2,
                 modifier = Modifier.weight(1f),
                 onClick = onDumpKeys
             )
             StudioButton(
-                text = "مسح السجل",
+                text = "Clear Log",
                 bgColor = Surface2,
                 modifier = Modifier.weight(0.6f),
                 onClick = onClear
             )
         }
 
-        CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f)
-                    .clip(RoundedCornerShape(16.dp))
-                    .background(TerminalBg)
-                    .border(1.dp, TerminalBorder, RoundedCornerShape(16.dp))
-                    .padding(14.dp)
-            ) {
-                if (logs.isEmpty()) {
-                    Text(
-                        text = "[READY] Waiting for router API commands...",
-                        color = TermTime,
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 12.sp
-                    )
-                } else {
-                    LazyColumn(
-                        state = listState,
-                        verticalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        items(logs) { entry ->
-                            val msgColor = when (entry.type) {
-                                LogType.SYS -> TermSys
-                                LogType.OK -> TermOk
-                                LogType.ERR -> TermErr
-                                LogType.WARN -> TermWarn
-                                LogType.ACT -> TermAct
-                            }
-                            Row {
-                                Text(
-                                    text = "[${entry.time}] ",
-                                    color = TermTime,
-                                    fontFamily = FontFamily.Monospace,
-                                    fontSize = 11.sp
-                                )
-                                Text(
-                                    text = entry.text,
-                                    color = msgColor,
-                                    fontFamily = FontFamily.Monospace,
-                                    fontSize = 11.sp,
-                                    fontWeight = if (entry.type == LogType.ERR) FontWeight.Bold else FontWeight.Normal
-                                )
-                            }
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)
+                .clip(RoundedCornerShape(16.dp))
+                .background(TerminalBg)
+                .border(1.dp, TerminalBorder, RoundedCornerShape(16.dp))
+                .padding(14.dp)
+        ) {
+            if (logs.isEmpty()) {
+                Text(
+                    text = "[READY] Standby for router API commands...",
+                    color = TermTime,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 12.sp
+                )
+            } else {
+                LazyColumn(
+                    state = listState,
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    items(logs) { entry ->
+                        val msgColor = when (entry.type) {
+                            LogType.SYS -> TermSys
+                            LogType.OK -> TermOk
+                            LogType.ERR -> TermErr
+                            LogType.WARN -> TermWarn
+                            LogType.ACT -> TermAct
+                        }
+                        Row {
+                            Text(
+                                text = "[${entry.time}] ",
+                                color = TermTime,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 11.sp
+                            )
+                            Text(
+                                text = entry.text,
+                                color = msgColor,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 11.sp,
+                                fontWeight = if (entry.type == LogType.ERR) FontWeight.Bold else FontWeight.Normal
+                            )
                         }
                     }
                 }
@@ -654,7 +640,7 @@ fun TerminalTab(
     }
 }
 
-// ======================= تبويب 4: الإعدادات والاتصال =======================
+// ======================= Tab 4: Settings =======================
 @Composable
 fun SettingsTab(
     routerIp: String,
@@ -676,41 +662,41 @@ fun SettingsTab(
         verticalArrangement = Arrangement.spacedBy(15.dp)
     ) {
         StudioCard {
-            Text("إدارة اتصال الراوتر", color = TextMain, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            Text("Router Management", color = TextMain, fontSize = 16.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(14.dp))
 
-            StudioInputLabel("عنوان الراوتر (Gateway IP)")
+            StudioInputLabel("GATEWAY IP")
             StudioTextField(value = routerIp, onValueChange = onIpChange, placeholder = "192.168.1.1")
 
             Spacer(Modifier.height(12.dp))
-            StudioInputLabel("اسم المستخدم")
+            StudioInputLabel("USERNAME")
             StudioTextField(value = username, onValueChange = onUserChange, placeholder = "admin")
 
             Spacer(Modifier.height(12.dp))
-            StudioInputLabel("كلمة المرور")
+            StudioInputLabel("PASSWORD")
             StudioTextField(
                 value = password,
                 onValueChange = onPassChange,
-                placeholder = "أدخل كلمة مرور صفحة الراوتر",
+                placeholder = "Router admin password",
                 isPassword = true
             )
 
             Spacer(Modifier.height(16.dp))
             if (!isConnected) {
-                StudioButton(text = "اتصال بالراوتر", bgColor = Accent, onClick = onConnect)
+                StudioButton(text = "Connect Selected", bgColor = Accent, onClick = onConnect)
             } else {
-                StudioButton(text = "إنهاء الجلسة", bgColor = StatusDnd, onClick = onDisconnect)
+                StudioButton(text = "Terminate Session", bgColor = StatusDnd, onClick = onDisconnect)
             }
         }
 
         StudioCard {
-            Text("حالة النظام", color = TextMain, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            Text("System Status", color = TextMain, fontSize = 16.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(10.dp))
             Text(
-                text = "• الحالة: ${if (isConnected) "متصل بالراوتر" else "غير متصل"}\n" +
-                        "• الموديل المستهدف: ZXHN H108N V2.5\n" +
-                        "• محرك الاتصال: OkHttp + ZTE .gch Parser\n" +
-                        "• ربط شبكة الواي فاي: مفعل تلقائياً",
+                text = "• Connection: ${if (isConnected) "Online & Connected" else "Offline"}\n" +
+                        "• Target Model: ZXHN H108N V2.5\n" +
+                        "• TLS Engine: BouncyCastle TLS 1.0 Native\n" +
+                        "• Wi-Fi Binding: Enabled",
                 color = TextMuted,
                 fontSize = 12.sp,
                 lineHeight = 22.sp
@@ -729,14 +715,14 @@ fun SettingsTab(
                 ) {
                     Icon(Icons.Rounded.Warning, null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
-                    Text("إعادة تشغيل الراوتر", fontWeight = FontWeight.Bold)
+                    Text("Reboot Router", fontWeight = FontWeight.Bold)
                 }
             }
         }
     }
 }
 
-// ======================= نافذة تفاصيل الجهاز (Modal) =======================
+// ======================= Device Action Modal =======================
 @Composable
 fun DeviceActionModal(
     device: ConnectedDevice,
@@ -789,15 +775,15 @@ fun DeviceActionModal(
                 }
 
                 Spacer(Modifier.height(16.dp))
-                StudioButton(text = "حظر الجهاز (MAC Filter)", bgColor = StatusDnd, onClick = onBlock)
+                StudioButton(text = "Block MAC Address", bgColor = StatusDnd, onClick = onBlock)
                 Spacer(Modifier.height(8.dp))
-                StudioButton(text = "إغلاق", bgColor = Surface2, onClick = onDismiss)
+                StudioButton(text = "Close", bgColor = Surface2, onClick = onDismiss)
             }
         }
     }
 }
 
-// ======================= مكونات التصميم المشتركة =======================
+// ======================= Shared Studio Components =======================
 @Composable
 fun FloatingBottomNav(
     activeTab: Int,
@@ -805,10 +791,10 @@ fun FloatingBottomNav(
     modifier: Modifier = Modifier
 ) {
     val items = listOf(
-        Pair("الراوتر", Icons.Rounded.Home),
-        Pair("الأجهزة", Icons.Rounded.Phone),
-        Pair("الطرفية", Icons.Rounded.Build),
-        Pair("الإعدادات", Icons.Rounded.Settings)
+        Pair("Router", Icons.Rounded.Home),
+        Pair("Devices", Icons.Rounded.Phone),
+        Pair("Terminal", Icons.Rounded.Build),
+        Pair("Settings", Icons.Rounded.Settings)
     )
 
     Row(
@@ -903,7 +889,8 @@ fun StudioInputLabel(text: String) {
         text = text,
         color = TextMuted,
         fontSize = 11.sp,
-        fontWeight = FontWeight.SemiBold,
+        fontWeight = FontWeight.Bold,
+        letterSpacing = 0.5.sp,
         modifier = Modifier.padding(bottom = 6.dp)
     )
 }
