@@ -12,6 +12,7 @@ import okhttp3.CookieJar
 import okhttp3.FormBody
 import okhttp3.HttpUrl
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.TlsVersion
 import java.net.InetAddress
@@ -27,6 +28,28 @@ import javax.net.ssl.SSLSocketFactory
 import javax.net.ssl.X509TrustManager
 
 enum class LogType { SYS, OK, ERR, WARN, ACT }
+
+private enum class TlsMode(
+    val label: String,
+    val okHttpVersions: Array<TlsVersion>,
+    val socketProtocols: Set<String>
+) {
+    NO_TLS13(
+        "TLS 1.2 / 1.1 / 1.0 (No TLS 1.3)",
+        arrayOf(TlsVersion.TLS_1_2, TlsVersion.TLS_1_1, TlsVersion.TLS_1_0),
+        setOf("TLSv1.2", "TLSv1.1", "TLSv1")
+    ),
+    TLS10_ONLY(
+        "TLS 1.0 Only",
+        arrayOf(TlsVersion.TLS_1_0),
+        setOf("TLSv1")
+    ),
+    SSLV3_AND_TLS10(
+        "SSLv3 + TLS 1.0",
+        arrayOf(TlsVersion.TLS_1_0, TlsVersion.SSL_3_0),
+        setOf("TLSv1", "SSLv3")
+    )
+}
 
 data class DslStats(
     val status: String = "غير معروف",
@@ -58,7 +81,8 @@ class ZteRouterClient(
     private var targetHost: String = "192.168.1.1"
 
     private class LegacyTlsSocketFactory(
-        private val delegate: SSLSocketFactory
+        private val delegate: SSLSocketFactory,
+        private val allowedProtocols: Set<String>
     ) : SSLSocketFactory() {
 
         override fun getDefaultCipherSuites(): Array<String> = delegate.defaultCipherSuites
@@ -78,8 +102,7 @@ class ZteRouterClient(
 
         private fun patch(socket: Socket): Socket {
             if (socket is SSLSocket) {
-                val wanted = setOf("TLSv1.3", "TLSv1.2", "TLSv1.1", "TLSv1")
-                val enabled = socket.supportedProtocols.filter { it in wanted }.toTypedArray()
+                val enabled = socket.supportedProtocols.filter { it in allowedProtocols }.toTypedArray()
                 if (enabled.isNotEmpty()) {
                     socket.enabledProtocols = enabled
                 }
@@ -94,7 +117,7 @@ class ZteRouterClient(
         }
     }
 
-    private fun buildClient(): OkHttpClient {
+    private fun buildClient(mode: TlsMode, followRedirects: Boolean = true): OkHttpClient {
         @SuppressLint("CustomX509TrustManager")
         val localTrustManager = object : X509TrustManager {
             @SuppressLint("TrustAllX509TrustManager")
@@ -108,21 +131,22 @@ class ZteRouterClient(
             init(null, arrayOf(localTrustManager), SecureRandom())
         }
 
-        val legacyTlsSpec = ConnectionSpec.Builder(ConnectionSpec.COMPATIBLE_TLS)
-            .tlsVersions(
-                TlsVersion.TLS_1_3,
-                TlsVersion.TLS_1_2,
-                TlsVersion.TLS_1_1,
-                TlsVersion.TLS_1_0
-            )
+        val tlsSpec = ConnectionSpec.Builder(ConnectionSpec.COMPATIBLE_TLS)
+            .tlsVersions(*mode.okHttpVersions)
             .allEnabledCipherSuites()
             .build()
 
         val builder = OkHttpClient.Builder()
-            .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(12, TimeUnit.SECONDS)
-            .connectionSpecs(listOf(legacyTlsSpec, ConnectionSpec.CLEARTEXT))
-            .sslSocketFactory(LegacyTlsSocketFactory(sslContext.socketFactory), localTrustManager)
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(10, TimeUnit.SECONDS)
+            .protocols(listOf(Protocol.HTTP_1_1))
+            .followRedirects(followRedirects)
+            .followSslRedirects(followRedirects)
+            .connectionSpecs(listOf(tlsSpec, ConnectionSpec.CLEARTEXT))
+            .sslSocketFactory(
+                LegacyTlsSocketFactory(sslContext.socketFactory, mode.socketProtocols),
+                localTrustManager
+            )
             .hostnameVerifier { hostname, _ ->
                 hostname == targetHost ||
                     hostname.startsWith("192.168.") ||
@@ -166,7 +190,7 @@ class ZteRouterClient(
         return builder.build()
     }
 
-    private var client: OkHttpClient = buildClient()
+    private var client: OkHttpClient = buildClient(TlsMode.NO_TLS13)
 
     fun setRouterIp(ip: String) {
         val trimmed = ip.trim().trimEnd('/')
@@ -189,23 +213,68 @@ class ZteRouterClient(
             try {
                 setRouterIp(ip)
                 cookieStore.clear()
-                client = buildClient()
-                onLog("HANDSHAKE -> GET $baseUrl/", LogType.SYS)
 
-                val initReq = Request.Builder().url("$baseUrl/").get().build()
-                val initHtml = client.newCall(initReq).execute().use { resp ->
-                    val finalUrl = resp.request.url
-                    val portPart = if (
-                        (finalUrl.scheme == "http" && finalUrl.port != 80) ||
-                        (finalUrl.scheme == "https" && finalUrl.port != 443)
-                    ) ":${finalUrl.port}" else ""
-                    val resolvedBase = "${finalUrl.scheme}://${finalUrl.host}$portPart"
-                    if (resolvedBase != baseUrl) {
-                        baseUrl = resolvedBase
-                        targetHost = finalUrl.host
-                        onLog("REDIRECTED -> $baseUrl (LEGACY TLS OK)", LogType.ACT)
+                var initHtml = ""
+                var needsHttpsProbe = baseUrl.startsWith("https://")
+
+                // 1. فحص الاتصال الأولي بدون تحويل تلقائي لمعرفة رد الراوتر الحقيقي
+                if (!needsHttpsProbe) {
+                    onLog("PROBE -> GET $baseUrl/ (NO-REDIRECT)", LogType.SYS)
+                    val probeClient = buildClient(TlsMode.NO_TLS13, followRedirects = false)
+                    val probeReq = Request.Builder().url("$baseUrl/").get().build()
+                    probeClient.newCall(probeReq).execute().use { resp ->
+                        val location = resp.header("Location")
+                        onLog("HTTP ${resp.code}${if (location != null) " -> Location: $location" else ""}", LogType.ACT)
+                        if (resp.code in 300..399 && location != null) {
+                            if (location.startsWith("https://", ignoreCase = true)) {
+                                needsHttpsProbe = true
+                                val cleanTarget = location.removePrefix("https://").substringBefore("/")
+                                baseUrl = "https://$cleanTarget"
+                                targetHost = cleanTarget.substringBefore(":")
+                            } else {
+                                client = buildClient(TlsMode.NO_TLS13, followRedirects = true)
+                                initHtml = client.newCall(Request.Builder().url("$baseUrl/").get().build())
+                                    .execute().use { it.body?.string() ?: "" }
+                            }
+                        } else {
+                            client = buildClient(TlsMode.NO_TLS13, followRedirects = true)
+                            initHtml = resp.body?.string() ?: ""
+                        }
                     }
-                    resp.body?.string() ?: ""
+                }
+
+                // 2. إذا فرض الراوتر HTTPS، نجرب أوضاع TLS القديمة بالتدريج
+                if (needsHttpsProbe) {
+                    val supported = try {
+                        SSLContext.getDefault().supportedSSLParameters.protocols.joinToString(", ")
+                    } catch (_: Exception) {
+                        "unknown"
+                    }
+                    onLog("PHONE TLS SUPPORT: [$supported]", LogType.SYS)
+
+                    var lastErr: String? = null
+                    for (mode in TlsMode.entries) {
+                        try {
+                            onLog("TRY HTTPS (${mode.label}) -> $baseUrl/", LogType.ACT)
+                            val candidate = buildClient(mode, followRedirects = true)
+                            val html = candidate.newCall(Request.Builder().url("$baseUrl/").get().build())
+                                .execute().use { it.body?.string() ?: "" }
+                            if (html.isNotEmpty()) {
+                                client = candidate
+                                initHtml = html
+                                onLog("HTTPS CONNECTED USING: ${mode.label}", LogType.OK)
+                                break
+                            }
+                        } catch (e: Exception) {
+                            lastErr = e.message
+                            onLog("MODE FAILED (${mode.label}): ${e.message}", LogType.WARN)
+                        }
+                    }
+
+                    if (initHtml.isEmpty()) {
+                        onLog("ALL TLS MODES FAILED -> ROUTER LIKELY USES SSLv3 OR BLOCKED CIPHER ($lastErr)", LogType.ERR)
+                        return@withContext false
+                    }
                 }
 
                 if (initHtml.isEmpty()) {

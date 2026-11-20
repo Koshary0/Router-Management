@@ -356,7 +356,7 @@ fun RouterStatusTab(
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
-                            imageVector = Icons.Rounded.Router,
+                            imageVector = Icons.Rounded.Home,
                             contentDescription = null,
                             tint = if (isConnected) Accent else TextMuted,
                             modifier = Modifier.size(46.dp)
@@ -403,7 +403,7 @@ fun RouterStatusTab(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        Icon(Icons.Rounded.AccessTime, null, tint = StatusOnline, modifier = Modifier.size(14.dp))
+                        Icon(Icons.Rounded.CheckCircle, null, tint = StatusOnline, modifier = Modifier.size(14.dp))
                         Text(uptimeBadge, color = StatusOnline, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                     }
                 }
@@ -546,7 +546,7 @@ fun DevicesTab(
                                     .background(Surface2),
                                 contentAlignment = Alignment.Center
                             ) {
-                                Icon(Icons.Rounded.Devices, null, tint = Accent, modifier = Modifier.size(20.dp))
+                                Icon(Icons.Rounded.Phone, null, tint = Accent, modifier = Modifier.size(20.dp))
                             }
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(device.hostName, color = TextMain, fontSize = 14.sp, fontWeight = FontWeight.Bold)
@@ -727,7 +727,7 @@ fun SettingsTab(
                     border = BorderStroke(1.dp, StatusDnd),
                     colors = ButtonDefaults.outlinedButtonColors(contentColor = StatusDnd)
                 ) {
-                    Icon(Icons.Rounded.PowerSettingsNew, null, modifier = Modifier.size(18.dp))
+                    Icon(Icons.Rounded.Warning, null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
                     Text("إعادة تشغيل الراوتر", fontWeight = FontWeight.Bold)
                 }
@@ -757,7 +757,7 @@ fun DeviceActionModal(
                         .border(3.dp, Accent, CircleShape),
                     contentAlignment = Alignment.Center
                 ) {
-                    Icon(Icons.Rounded.Devices, null, tint = Accent, modifier = Modifier.size(34.dp))
+                    Icon(Icons.Rounded.Phone, null, tint = Accent, modifier = Modifier.size(34.dp))
                 }
                 Spacer(Modifier.height(10.dp))
                 Text(device.hostName, color = TextMain, fontSize = 20.sp, fontWeight = FontWeight.Bold)
@@ -805,9 +805,9 @@ fun FloatingBottomNav(
     modifier: Modifier = Modifier
 ) {
     val items = listOf(
-        Pair("الراوتر", Icons.Rounded.Router),
-        Pair("الأجهزة", Icons.Rounded.Devices),
-        Pair("الطرفية", Icons.Rounded.Terminal),
+        Pair("الراوتر", Icons.Rounded.Home),
+        Pair("الأجهزة", Icons.Rounded.Phone),
+        Pair("الطرفية", Icons.Rounded.Build),
         Pair("الإعدادات", Icons.Rounded.Settings)
     )
 
