@@ -86,6 +86,18 @@ class ZteRouterClient(
     private val context: Context,
     private val onLog: (String, LogType) -> Unit
 ) {
+    companion object {
+        // المسارات الفعلية المستخرجة من قائمة ZXHN H108N V2.5
+        private const val PAGE_DSL = "status_dsl_info_t.gch"
+        private const val PAGE_DHCP = "net_dhcp_dynamic_t.gch"
+        private const val PAGE_WLAN_BASIC = "net_11n_conf_t.gch"
+        private const val PAGE_WLAN_SSID = "net_wlan_essid_t.gch"
+        private const val PAGE_WLAN_SEC = "net_wlan_secrity_t.gch"
+        private const val PAGE_WLAN_MAC_FILTER = "net_wlan_MacFilter_t.gch"
+        private const val PAGE_WLAN_ASSOC = "net_wlan_assoc_t.gch"
+        private const val PAGE_REBOOT = "manager_dev_conf_t.gch"
+    }
+
     private val cookieStore = mutableMapOf<String, MutableList<Cookie>>()
     private var baseUrl: String = "https://192.168.1.1"
     private var targetHost: String = "192.168.1.1"
@@ -94,12 +106,6 @@ class ZteRouterClient(
     private var savedUser: String = ""
     private var savedPass: String = ""
     private var isRelogging: Boolean = false
-
-    private val discoveredPages = linkedSetOf<String>()
-    private var wlanBasicPage: String? = null
-    private var wlanSsidPage: String? = null
-    private var wlanSecPage: String? = null
-    private var macFilterPage: String? = null
 
     private val bcJsseProvider: BouncyCastleJsseProvider by lazy {
         try {
@@ -228,11 +234,6 @@ class ZteRouterClient(
     fun clearSession() {
         cookieStore.clear()
         savedPass = ""
-        discoveredPages.clear()
-        wlanBasicPage = null
-        wlanSsidPage = null
-        wlanSecPage = null
-        macFilterPage = null
         onLog("SESSION TERMINATED", LogType.WARN)
     }
 
@@ -242,11 +243,6 @@ class ZteRouterClient(
             savedIp = ip
             savedUser = username
             savedPass = password
-            discoveredPages.clear()
-            wlanBasicPage = null
-            wlanSsidPage = null
-            wlanSecPage = null
-            macFilterPage = null
             performLogin(silent = false)
         }
 
@@ -300,11 +296,11 @@ class ZteRouterClient(
                 !respHtml.contains("Frm_Logintoken") &&
                 !respHtml.contains("Password is wrong", ignoreCase = true)
 
-            if (ok) {
-                collectMenuPages(respHtml)
-                if (!silent) onLog("AUTH SUCCESS (TOKEN=$loginToken)", LogType.OK)
-            } else {
-                if (!silent) onLog("AUTH REJECTED - CHECK CREDENTIALS", LogType.ERR)
+            if (!silent) {
+                onLog(
+                    if (ok) "AUTH SUCCESS (TOKEN=$loginToken)" else "AUTH REJECTED - CHECK CREDENTIALS",
+                    if (ok) LogType.OK else LogType.ERR
+                )
             }
             ok
         } catch (e: Exception) {
@@ -313,112 +309,59 @@ class ZteRouterClient(
         }
     }
 
-    // ===================== 2. DSL TELEMETRY =====================
+    // ===================== 2. DSL TELEMETRY (TABLE + HIDDEN INPUTS / 10) =====================
     suspend fun getDslStats(): DslStats = withContext(Dispatchers.IO) {
         try {
-            onLog("FETCH -> status_dsl_info_t.gch", LogType.SYS)
-            val html = fetchPage("status_dsl_info_t.gch")
+            onLog("FETCH -> $PAGE_DSL", LogType.SYS)
+            val html = fetchPage(PAGE_DSL)
             if (html.isBlank()) return@withContext DslStats()
 
             val rows = parseHtmlTableRows(html)
-            val jsMap = parseTransferMeaning(html)
-            val rowDebug = mutableListOf<String>()
-            rows.forEach { rowDebug.add(it.joinToString(" | ")) }
+            val hiddenInputs = extractFormFields(html)
 
-            var status = jsMap["LinkStatus"] ?: jsMap["ModulationType"] ?: "Unknown"
-            var downRate = jsMap["DownstreamCurrRate"] ?: "--"
-            var upRate = jsMap["UpstreamCurrRate"] ?: "--"
-            var maxDown = jsMap["DownstreamMaxRate"] ?: "--"
-            var maxUp = jsMap["UpstreamMaxRate"] ?: "--"
-            var downSnr = formatDb(jsMap["DownstreamNoiseMargin"])
-            var upSnr = formatDb(jsMap["UpstreamNoiseMargin"])
-            var downAttn = formatDb(jsMap["DownstreamAttenuation"])
-            var upAttn = formatDb(jsMap["UpstreamAttenuation"])
+            var status = "Unknown"
+            var downRate = "--"
+            var upRate = "--"
+            var maxDown = "--"
+            var maxUp = "--"
+
+            // قراءة قيم SNR والتوهين من الحقول المخفية وقسمتها على 10 مثل pageGetValues() في الراوتر
+            val upSnr = formatTenthsDb(hiddenInputs["Upstream_noise_margin"])
+            val downSnr = formatTenthsDb(hiddenInputs["Downstream_noise_margin"])
+            val upAttn = formatTenthsDb(hiddenInputs["Upstream_attenuation"])
+            val downAttn = formatTenthsDb(hiddenInputs["Downstream_attenuation"])
 
             for (cells in rows) {
                 if (cells.size < 2) continue
                 val label = cells[0].lowercase(Locale.US)
                 val v1 = cells[1]
-                val v2 = cells.getOrNull(2) ?: ""
-                val upFirst = label.contains("up") && label.contains("down") &&
-                    label.indexOf("up") < label.indexOf("down")
-
                 when {
-                    label.contains("link status") || label.contains("line status") || label == "status" -> {
-                        if (v1.isNotBlank()) status = v1
-                    }
-                    label.contains("modulation") && status == "Unknown" -> {
-                        if (v1.isNotBlank()) status = v1
-                    }
-                    label.contains("actual rate") || label.contains("current rate") || label.contains("actual data rate") -> {
-                        val pair = extractNumberPair(v1)
-                        when {
-                            pair != null -> {
-                                upRate = if (upFirst) pair.first else pair.second
-                                downRate = if (upFirst) pair.second else pair.first
-                            }
-                            cells.size >= 3 -> {
-                                upRate = if (upFirst) cleanNum(v1) else cleanNum(v2)
-                                downRate = if (upFirst) cleanNum(v2) else cleanNum(v1)
-                            }
+                    label.contains("link status") -> status = v1
+                    label.contains("actual rate") -> {
+                        extractNumberPair(v1)?.let { (up, down) ->
+                            upRate = up
+                            downRate = down
                         }
                     }
-                    label.contains("attainable") || label.contains("max rate") -> {
-                        val pair = extractNumberPair(v1)
-                        when {
-                            pair != null -> {
-                                maxUp = if (upFirst) pair.first else pair.second
-                                maxDown = if (upFirst) pair.second else pair.first
-                            }
-                            cells.size >= 3 -> {
-                                maxUp = if (upFirst) cleanNum(v1) else cleanNum(v2)
-                                maxDown = if (upFirst) cleanNum(v2) else cleanNum(v1)
-                            }
-                        }
-                    }
-                    label.contains("noise margin") || label.contains("snr") -> {
-                        val pair = extractNumberPair(v1)
-                        if (pair != null) {
-                            upSnr = formatDb(if (upFirst) pair.first else pair.second)
-                            downSnr = formatDb(if (upFirst) pair.second else pair.first)
-                        } else if (cells.size >= 3) {
-                            upSnr = formatDb(if (upFirst) v1 else v2)
-                            downSnr = formatDb(if (upFirst) v2 else v1)
-                        }
-                    }
-                    label.contains("attenuation") -> {
-                        val pair = extractNumberPair(v1)
-                        if (pair != null) {
-                            upAttn = formatDb(if (upFirst) pair.first else pair.second)
-                            downAttn = formatDb(if (upFirst) pair.second else pair.first)
-                        } else if (cells.size >= 3) {
-                            upAttn = formatDb(if (upFirst) v1 else v2)
-                            downAttn = formatDb(if (upFirst) v2 else v1)
+                    label.contains("attainable rate") -> {
+                        extractNumberPair(v1)?.let { (up, down) ->
+                            maxUp = up
+                            maxDown = down
                         }
                     }
                 }
             }
 
-            if (downSnr == "--" || downAttn == "--") {
-                val jsSnrUp = extractJsVar(html, "UpNoiseMargin", "UpstreamNoiseMargin", "Up_NoiseMargin", "snr_up", "UpSnr")
-                val jsSnrDown = extractJsVar(html, "DownNoiseMargin", "DownstreamNoiseMargin", "Down_NoiseMargin", "snr_down", "DownSnr")
-                val jsAttnUp = extractJsVar(html, "UpAttenuation", "UpstreamAttenuation", "Up_Attenuation", "attn_up")
-                val jsAttnDown = extractJsVar(html, "DownAttenuation", "DownstreamAttenuation", "Down_Attenuation", "attn_down")
-                if (upSnr == "--" && jsSnrUp != null) upSnr = formatDb(jsSnrUp)
-                if (downSnr == "--" && jsSnrDown != null) downSnr = formatDb(jsSnrDown)
-                if (upAttn == "--" && jsAttnUp != null) upAttn = formatDb(jsAttnUp)
-                if (downAttn == "--" && jsAttnDown != null) downAttn = formatDb(jsAttnDown)
+            val debugRows = buildList {
+                rows.forEach { add(it.joinToString(" | ")) }
+                add("SNR (Down/Up): $downSnr / $upSnr")
+                add("ATTN (Down/Up): $downAttn / $upAttn")
+                hiddenInputs["Downstream_power"]?.let { p ->
+                    add("POWER (Down/Up): ${formatTenthsUnit(p, "dBm")} / ${formatTenthsUnit(hiddenInputs["Upstream_power"], "dBm")}")
+                }
             }
 
-            if (downSnr == "--") {
-                Regex("""(?is)<tr[^>]*>.*?Noise Margin.*?</tr>""")
-                    .find(html)?.value
-                    ?.replace(Regex("""\s+"""), " ")
-                    ?.take(220)
-                    ?.let { rowDebug.add("RAW SNR HTML: $it") }
-            }
-
-            onLog("DSL OK -> DOWN=$downRate, UP=$upRate, SNR=$downSnr/$upSnr", LogType.OK)
+            onLog("DSL OK -> DOWN=$downRate, UP=$upRate, SNR=$downSnr/$upSnr, ATTN=$downAttn", LogType.OK)
             DslStats(
                 status = status,
                 downRateKbps = downRate,
@@ -429,7 +372,7 @@ class ZteRouterClient(
                 upSnrDb = upSnr,
                 downAttnDb = downAttn,
                 upAttnDb = upAttn,
-                rawRows = rowDebug
+                rawRows = debugRows
             )
         } catch (e: Exception) {
             onLog("DSL ERR: ${e.message}", LogType.ERR)
@@ -440,9 +383,18 @@ class ZteRouterClient(
     // ===================== 3. CONNECTED DEVICES & KICK / BLOCK / UNBLOCK =====================
     suspend fun getConnectedDevices(): List<ConnectedDevice> = withContext(Dispatchers.IO) {
         try {
-            onLog("SCAN -> net_dhcp_dynamic_t.gch", LogType.SYS)
-            val html = fetchPage("net_dhcp_dynamic_t.gch")
-            val map = parseTransferMeaning(html)
+            onLog("SCAN -> $PAGE_DHCP", LogType.SYS)
+            var html = fetchPage(PAGE_DHCP)
+            var map = parseTransferMeaning(html)
+
+            // إذا لم تظهر علامة IF_INSTNUM، نعيد تسجيل الدخول مرة واحدة تلقائياً
+            if (!map.containsKey("IF_INSTNUM") && savedPass.isNotEmpty()) {
+                onLog("STALE DHCP RESPONSE -> RE-LOGIN & RETRY", LogType.WARN)
+                if (performLogin(silent = true)) {
+                    html = rawGetPage(PAGE_DHCP)
+                    map = parseTransferMeaning(html)
+                }
+            }
 
             val indices = map.keys
                 .mapNotNull {
@@ -474,22 +426,23 @@ class ZteRouterClient(
 
     suspend fun getBlockedRules(): List<BlockedRule> = withContext(Dispatchers.IO) {
         try {
-            val resolved = resolveMacFilterPage() ?: return@withContext emptyList()
-            val map = parseTransferMeaning(resolved.second)
+            val html = fetchPage(PAGE_WLAN_MAC_FILTER)
+            if (html.isBlank()) return@withContext emptyList()
+            val map = parseTransferMeaning(html)
             val indices = map.keys
                 .mapNotNull {
-                    Regex("""^(?:SrcMacAddr|MACAddress|MacAddr)(\d+)$""").find(it)?.groupValues?.get(1)?.toIntOrNull()
+                    Regex("""^(?:MACAddress|SrcMacAddr|MacAddr)(\d+)$""").find(it)?.groupValues?.get(1)?.toIntOrNull()
                 }
                 .distinct()
                 .sorted()
 
             indices.mapNotNull { i ->
-                val mac = (map["SrcMacAddr$i"] ?: map["MACAddress$i"] ?: map["MacAddr$i"])
+                val mac = (map["MACAddress$i"] ?: map["SrcMacAddr$i"] ?: map["MacAddr$i"])
                     .orEmpty().uppercase(Locale.US)
                 if (mac.isBlank()) return@mapNotNull null
                 BlockedRule(
                     index = i,
-                    name = (map["Name$i"] ?: map["Description$i"]).orEmpty().ifBlank { "Rule #$i" },
+                    name = (map["Name$i"] ?: map["Description$i"] ?: map["SSIDName$i"]).orEmpty().ifBlank { "ACL #$i" },
                     macAddress = mac
                 )
             }
@@ -500,34 +453,51 @@ class ZteRouterClient(
 
     suspend fun blockMacAddress(mac: String, alias: String): Boolean = withContext(Dispatchers.IO) {
         try {
-            val resolved = resolveMacFilterPage() ?: run {
-                onLog("MAC FILTER PAGE NOT FOUND ON THIS FIRMWARE", LogType.ERR)
+            onLog("BLOCK MAC ($mac) -> $PAGE_WLAN_MAC_FILTER", LogType.ACT)
+            val html = fetchPage(PAGE_WLAN_MAC_FILTER)
+            val token = extractSessionToken(html)
+            if (html.isBlank() || token == null) {
+                onLog("CANNOT LOAD $PAGE_WLAN_MAC_FILTER OR TOKEN", LogType.ERR)
                 return@withContext false
             }
-            val (page, html) = resolved
-            onLog("BLOCK MAC ($mac) -> $page", LogType.ACT)
 
+            // أولاً: تفعيل وضع الحظر (Discard / Block) إذا كان ACL Policy متاحاً ومعطلاً
+            val initFields = extractFormFields(html)
+            val policyKey = listOf("ACLPolicy", "Policy", "Mode").firstOrNull { initFields.containsKey(it) }
+            if (policyKey != null && initFields[policyKey] != "Discard" && initFields[policyKey] != "2") {
+                val policyForm = LinkedHashMap(initFields)
+                policyForm["IF_ACTION"] = "apply"
+                policyForm["IF_ERRORSTR"] = "SUCC"
+                policyForm["IF_ERRORPARAM"] = "SUCC"
+                policyForm["IF_ERRORTYPE"] = "-1"
+                policyForm[policyKey] = if (html.contains("Discard")) "Discard" else "2"
+                policyForm["_SESSION_TOKEN"] = token
+                postForm(PAGE_WLAN_MAC_FILTER, policyForm)
+            }
+
+            // جلب توكن جديد لإضافة عنوان الـ MAC
+            val freshHtml = fetchPage(PAGE_WLAN_MAC_FILTER)
+            val freshToken = extractSessionToken(freshHtml) ?: token
+            val fields = extractFormFields(freshHtml)
             val cleanAlias = alias.replace(Regex("""[^a-zA-Z0-9_-]"""), "").take(14).ifBlank { "Blocked" }
-            val fields = extractFormFields(html)
+
             fields["IF_ACTION"] = "new"
             fields["IF_ERRORSTR"] = "SUCC"
             fields["IF_ERRORPARAM"] = "SUCC"
             fields["IF_ERRORTYPE"] = "-1"
-            fields["Enable"] = "1"
-            if (fields.containsKey("Name") || page.contains("macfilter", ignoreCase = true)) {
-                fields["Name"] = cleanAlias
-            }
+            if (fields.containsKey("Enable")) fields["Enable"] = "1"
+            if (fields.containsKey("Name")) fields["Name"] = cleanAlias
             when {
                 fields.containsKey("MACAddress") -> fields["MACAddress"] = mac.uppercase(Locale.US)
                 fields.containsKey("MacAddr") -> fields["MacAddr"] = mac.uppercase(Locale.US)
                 else -> {
                     fields["SrcMacAddr"] = mac.uppercase(Locale.US)
-                    fields["DstMacAddr"] = ""
+                    if (fields.containsKey("DstMacAddr")) fields["DstMacAddr"] = ""
                 }
             }
-            extractSessionToken(html)?.let { fields["_SESSION_TOKEN"] = it }
+            fields["_SESSION_TOKEN"] = freshToken
 
-            val ok = postForm(page, fields)
+            val ok = postForm(PAGE_WLAN_MAC_FILTER, fields)
             onLog(if (ok) "MAC BLOCKED: $mac" else "MAC BLOCK FAILED", if (ok) LogType.OK else LogType.ERR)
             ok
         } catch (e: Exception) {
@@ -538,20 +508,19 @@ class ZteRouterClient(
 
     suspend fun unblockRule(index: Int): Boolean = withContext(Dispatchers.IO) {
         try {
-            val resolved = resolveMacFilterPage() ?: return@withContext false
-            val (page, html) = resolved
-            onLog("UNBLOCK RULE #$index -> $page", LogType.ACT)
+            onLog("UNBLOCK RULE #$index -> $PAGE_WLAN_MAC_FILTER", LogType.ACT)
+            val html = fetchPage(PAGE_WLAN_MAC_FILTER)
+            val token = extractSessionToken(html) ?: return@withContext false
 
-            val fields = linkedMapOf(
-                "IF_ACTION" to "delete",
-                "IF_INDEX" to index.toString(),
-                "IF_ERRORSTR" to "SUCC",
-                "IF_ERRORPARAM" to "SUCC",
-                "IF_ERRORTYPE" to "-1"
-            )
-            extractSessionToken(html)?.let { fields["_SESSION_TOKEN"] = it }
+            val fields = extractFormFields(html)
+            fields["IF_ACTION"] = "delete"
+            fields["IF_INDEX"] = index.toString()
+            fields["IF_ERRORSTR"] = "SUCC"
+            fields["IF_ERRORPARAM"] = "SUCC"
+            fields["IF_ERRORTYPE"] = "-1"
+            fields["_SESSION_TOKEN"] = token
 
-            val ok = postForm(page, fields)
+            val ok = postForm(PAGE_WLAN_MAC_FILTER, fields)
             onLog(if (ok) "RULE #$index REMOVED" else "UNBLOCK FAILED", if (ok) LogType.OK else LogType.ERR)
             ok
         } catch (e: Exception) {
@@ -591,43 +560,28 @@ class ZteRouterClient(
     // ===================== 4. WI-FI PASSWORD, SSID & SPEED CONTROL =====================
     suspend fun getWifiConfig(): WifiConfig = withContext(Dispatchers.IO) {
         try {
-            ensureMenuDiscovered()
-            onLog("FETCH -> WLAN CONFIG", LogType.SYS)
-
-            val ssidRes = resolveWlanSsidPage()
-            val secRes = resolveWlanSecPage()
-            val basicRes = resolveWlanBasicPage()
-
-            val ssidMap = ssidRes?.second?.let { parseTransferMeaning(it) } ?: emptyMap()
-            val secMap = secRes?.second?.let { parseTransferMeaning(it) } ?: emptyMap()
-            val basicMap = basicRes?.second?.let { parseTransferMeaning(it) } ?: emptyMap()
+            onLog("FETCH -> $PAGE_WLAN_SSID / $PAGE_WLAN_SEC / $PAGE_WLAN_BASIC", LogType.SYS)
+            val ssidMap = parseTransferMeaning(fetchPage(PAGE_WLAN_SSID))
+            val secMap = parseTransferMeaning(fetchPage(PAGE_WLAN_SEC))
+            val basicMap = parseTransferMeaning(fetchPage(PAGE_WLAN_BASIC))
 
             val debugMap = linkedMapOf<String, String>()
-            debugMap["_SSID_PAGE"] = ssidRes?.first ?: "NOT_FOUND"
-            debugMap["_SEC_PAGE"] = secRes?.first ?: "NOT_FOUND"
-            debugMap["_BASIC_PAGE"] = basicRes?.first ?: "NOT_FOUND"
-            debugMap["_MAC_PAGE"] = macFilterPage ?: "PENDING"
-            val wlanDiscovered = discoveredPages.filter {
-                it.contains("wlan", ignoreCase = true) ||
-                    it.contains("mac", ignoreCase = true) ||
-                    it.contains("acl", ignoreCase = true)
-            }
-            if (wlanDiscovered.isNotEmpty()) {
-                debugMap["_MENU_PAGES"] = wlanDiscovered.joinToString(", ")
-            }
-            basicMap.forEach { (k, v) -> debugMap[k] = v }
+            basicMap.forEach { (k, v) -> debugMap["BASIC.$k"] = v }
+            ssidMap.entries.take(15).forEach { (k, v) -> debugMap["SSID.$k"] = v }
+            secMap.entries.filterNot { it.key.contains("Key", ignoreCase = true) || it.key.contains("Pass", ignoreCase = true) }
+                .take(15).forEach { (k, v) -> debugMap["SEC.$k"] = v }
 
             val cfg = WifiConfig(
-                ssid = ssidMap["ESSID"] ?: ssidMap["ESSID0"] ?: basicMap["ESSID"] ?: "",
-                hidden = (ssidMap["ESSIDHideEnable"] ?: ssidMap["ESSIDHideEnable0"]) == "1",
-                password = secMap["KeyPassphrase"] ?: secMap["PreSharedKey"] ?: secMap["KeyPassphrase0"] ?: "",
-                standard = basicMap["Standard"] ?: "b,g,n",
+                ssid = ssidMap["ESSID0"] ?: ssidMap["ESSID"] ?: "",
+                hidden = (ssidMap["ESSIDHideEnable0"] ?: ssidMap["ESSIDHideEnable"]) == "1",
+                password = secMap["KeyPassphrase0"] ?: secMap["KeyPassphrase"] ?: secMap["PreSharedKey0"] ?: secMap["PreSharedKey"] ?: "",
+                standard = basicMap["Standard"] ?: basicMap["Mode"] ?: "b,g,n",
                 bandWidth = basicMap["BandWidth"] ?: basicMap["ChannelWidth"] ?: "20MHz",
                 txPower = basicMap["TxPower"] ?: "100%",
                 rawBasicKeys = debugMap
             )
             onLog(
-                "WLAN -> SSID=${cfg.ssid.ifBlank { "--" }}, MODE=${cfg.standard}, BW=${cfg.bandWidth}, TX=${cfg.txPower}",
+                "WLAN OK -> SSID=${cfg.ssid.ifBlank { "--" }}, MODE=${cfg.standard}, BW=${cfg.bandWidth}, TX=${cfg.txPower}",
                 LogType.OK
             )
             cfg
@@ -643,23 +597,27 @@ class ZteRouterClient(
             return@withContext false
         }
         try {
-            val resolved = resolveWlanSecPage() ?: run {
-                onLog("WLAN SECURITY PAGE NOT FOUND", LogType.ERR)
+            onLog("UPDATE PASSWORD -> $PAGE_WLAN_SEC", LogType.ACT)
+            val html = fetchPage(PAGE_WLAN_SEC)
+            val token = extractSessionToken(html) ?: run {
+                onLog("MISSING TOKEN ON $PAGE_WLAN_SEC", LogType.ERR)
                 return@withContext false
             }
-            val (page, html) = resolved
-            onLog("UPDATING PASSWORD -> $page", LogType.ACT)
 
             val fields = extractFormFields(html)
             fields["IF_ACTION"] = "apply"
             fields["IF_ERRORSTR"] = "SUCC"
             fields["IF_ERRORPARAM"] = "SUCC"
             fields["IF_ERRORTYPE"] = "-1"
-            fields["KeyPassphrase"] = newPassword
+            if (fields.containsKey("KeyPassphrase")) fields["KeyPassphrase"] = newPassword
+            if (fields.containsKey("KeyPassphrase0")) fields["KeyPassphrase0"] = newPassword
             if (fields.containsKey("PreSharedKey")) fields["PreSharedKey"] = newPassword
-            extractSessionToken(html)?.let { fields["_SESSION_TOKEN"] = it }
+            if (!fields.containsKey("KeyPassphrase") && !fields.containsKey("KeyPassphrase0")) {
+                fields["KeyPassphrase"] = newPassword
+            }
+            fields["_SESSION_TOKEN"] = token
 
-            val ok = postForm(page, fields)
+            val ok = postForm(PAGE_WLAN_SEC, fields)
             onLog(if (ok) "WI-FI PASSWORD UPDATED" else "PASSWORD UPDATE FAILED", if (ok) LogType.OK else LogType.ERR)
             ok
         } catch (e: Exception) {
@@ -674,23 +632,25 @@ class ZteRouterClient(
             return@withContext false
         }
         try {
-            val resolved = resolveWlanSsidPage() ?: run {
-                onLog("WLAN SSID PAGE NOT FOUND", LogType.ERR)
+            onLog("UPDATE SSID ($newSsid, HIDE=$hideSsid) -> $PAGE_WLAN_SSID", LogType.ACT)
+            val html = fetchPage(PAGE_WLAN_SSID)
+            val token = extractSessionToken(html) ?: run {
+                onLog("MISSING TOKEN ON $PAGE_WLAN_SSID", LogType.ERR)
                 return@withContext false
             }
-            val (page, html) = resolved
-            onLog("UPDATING SSID ($newSsid, HIDE=$hideSsid) -> $page", LogType.ACT)
 
             val fields = extractFormFields(html)
             fields["IF_ACTION"] = "apply"
             fields["IF_ERRORSTR"] = "SUCC"
             fields["IF_ERRORPARAM"] = "SUCC"
             fields["IF_ERRORTYPE"] = "-1"
-            fields["ESSID"] = newSsid.trim()
-            fields["ESSIDHideEnable"] = if (hideSsid) "1" else "0"
-            extractSessionToken(html)?.let { fields["_SESSION_TOKEN"] = it }
+            if (fields.containsKey("ESSID")) fields["ESSID"] = newSsid.trim()
+            if (fields.containsKey("ESSID0")) fields["ESSID0"] = newSsid.trim()
+            if (fields.containsKey("ESSIDHideEnable")) fields["ESSIDHideEnable"] = if (hideSsid) "1" else "0"
+            if (fields.containsKey("ESSIDHideEnable0")) fields["ESSIDHideEnable0"] = if (hideSsid) "1" else "0"
+            fields["_SESSION_TOKEN"] = token
 
-            val ok = postForm(page, fields)
+            val ok = postForm(PAGE_WLAN_SSID, fields)
             onLog(if (ok) "SSID SETTINGS SAVED" else "SSID UPDATE FAILED", if (ok) LogType.OK else LogType.ERR)
             ok
         } catch (e: Exception) {
@@ -702,28 +662,28 @@ class ZteRouterClient(
     suspend fun applySpeedPreset(preset: SpeedPreset, customTxPower: String? = null): Boolean =
         withContext(Dispatchers.IO) {
             try {
-                val resolved = resolveWlanBasicPage() ?: run {
-                    onLog("WLAN BASIC PAGE NOT FOUND (TAP WLAN KEYS)", LogType.ERR)
+                val tx = customTxPower ?: preset.txPower
+                onLog("SPEED [${preset.title}] -> $PAGE_WLAN_BASIC (MODE=${preset.standard}, BW=${preset.bandWidth}, TX=$tx)", LogType.ACT)
+                val html = fetchPage(PAGE_WLAN_BASIC)
+                val token = extractSessionToken(html) ?: run {
+                    onLog("MISSING TOKEN ON $PAGE_WLAN_BASIC", LogType.ERR)
                     return@withContext false
                 }
-                val (page, html) = resolved
-                val tx = customTxPower ?: preset.txPower
-                onLog("SPEED [${preset.title}] -> $page (MODE=${preset.standard}, BW=${preset.bandWidth}, TX=$tx)", LogType.ACT)
 
                 val fields = extractFormFields(html)
                 fields["IF_ACTION"] = "apply"
                 fields["IF_ERRORSTR"] = "SUCC"
                 fields["IF_ERRORPARAM"] = "SUCC"
                 fields["IF_ERRORTYPE"] = "-1"
-                fields["Standard"] = preset.standard
+                if (fields.containsKey("Standard")) fields["Standard"] = preset.standard
                 if (fields.containsKey("BandWidth")) fields["BandWidth"] = preset.bandWidth
                 if (fields.containsKey("ChannelWidth")) fields["ChannelWidth"] = preset.bandWidth
                 if (fields.containsKey("TxPower")) fields["TxPower"] = tx
                 if (fields.containsKey("DataRate")) fields["DataRate"] = preset.dataRate
                 if (fields.containsKey("BasicDataRates")) fields["BasicDataRates"] = preset.dataRate
-                extractSessionToken(html)?.let { fields["_SESSION_TOKEN"] = it }
+                fields["_SESSION_TOKEN"] = token
 
-                val ok = postForm(page, fields)
+                val ok = postForm(PAGE_WLAN_BASIC, fields)
                 onLog(
                     if (ok) "SPEED PROFILE APPLIED (${preset.title})" else "SPEED PROFILE FAILED",
                     if (ok) LogType.OK else LogType.ERR
@@ -738,13 +698,10 @@ class ZteRouterClient(
     // ===================== 5. REBOOT =====================
     suspend fun rebootRouter(): Boolean = withContext(Dispatchers.IO) {
         try {
-            val page = discoveredPages.firstOrNull {
-                it.contains("dev_conf", ignoreCase = true) || it.contains("restart", ignoreCase = true)
-            } ?: "manager_dev_conf_t.gch"
-            onLog("REBOOT -> $page", LogType.WARN)
-            val html = fetchPage(page)
-            if (html.isBlank()) {
-                onLog("REBOOT PAGE UNAVAILABLE", LogType.ERR)
+            onLog("REBOOT -> $PAGE_REBOOT", LogType.WARN)
+            val html = fetchPage(PAGE_REBOOT)
+            val token = extractSessionToken(html) ?: run {
+                onLog("MISSING TOKEN ON $PAGE_REBOOT", LogType.ERR)
                 return@withContext false
             }
 
@@ -753,11 +710,10 @@ class ZteRouterClient(
                 "IF_ERRORSTR" to "SUCC",
                 "IF_ERRORPARAM" to "SUCC",
                 "IF_ERRORTYPE" to "-1",
-                "flag" to "1"
+                "flag" to "1",
+                "_SESSION_TOKEN" to token
             )
-            extractSessionToken(html)?.let { fields["_SESSION_TOKEN"] = it }
-
-            val ok = postForm(page, fields)
+            val ok = postForm(PAGE_REBOOT, fields)
             onLog(if (ok) "REBOOT TRANSMITTED" else "REBOOT FAILED", if (ok) LogType.OK else LogType.ERR)
             ok
         } catch (e: Exception) {
@@ -766,7 +722,7 @@ class ZteRouterClient(
         }
     }
 
-    // ===================== 6. FULL HTML DIAGNOSTIC EXPORTER =====================
+    // ===================== 6. COMPACT FORMS EXPORTER (NO CSS BOILERPLATE) =====================
     suspend fun exportRouterHtmlDump(): String = withContext(Dispatchers.IO) {
         if (savedPass.isEmpty()) {
             onLog("EXPORT: CONNECT TO ROUTER FIRST", LogType.WARN)
@@ -775,90 +731,45 @@ class ZteRouterClient(
 
         val sb = StringBuilder()
 
-        fun sanitize(html: String): String {
-            var s = html
-            val sensitiveKeys = listOf(
-                "KeyPassphrase", "PreSharedKey", "Password",
-                "UserName", "Username", "WPAPSK", "IPAddress"
-            )
-            for (k in sensitiveKeys) {
+        fun sanitize(text: String): String {
+            var s = text
+            val sensitive = listOf("KeyPassphrase", "PreSharedKey", "Password", "UserName", "Username", "WPAPSK")
+            for (k in sensitive) {
                 s = Regex(
                     """(Transfer_meaning\(\s*['"]$k\d*['"]\s*,\s*['"])([^'"]*)(['"]\s*\))""",
-                    RegexOption.IGNORE_CASE
-                ).replace(s, "$1***REDACTED***$3")
-                s = Regex(
-                    """(name\s*=\s*["']$k\d*["'][^>]*value\s*=\s*["'])([^"']*)(["'])""",
                     RegexOption.IGNORE_CASE
                 ).replace(s, "$1***REDACTED***$3")
             }
             return s
         }
 
-        fun appendSection(title: String, content: String) {
-            sb.append("\n==================== $title (len=${content.length}) ====================\n")
-            sb.append(sanitize(content))
-            sb.append("\n")
+        fun extractBodyDiv(html: String): String {
+            val start = html.indexOf("<div id=\"div1\">")
+            val end = html.indexOf("<div class=\"bottom_div\"")
+            return if (start != -1 && end > start) {
+                html.substring(start, end)
+            } else {
+                html.replace(Regex("""(?is)<style[^>]*>.*?</style>"""), "").take(4000)
+            }
         }
 
+        val pages = listOf(
+            PAGE_WLAN_BASIC,
+            PAGE_WLAN_SSID,
+            PAGE_WLAN_SEC,
+            PAGE_WLAN_MAC_FILTER,
+            PAGE_WLAN_ASSOC,
+            PAGE_REBOOT
+        )
         try {
-            onLog("EXPORT: STARTING FRESH LOGIN...", LogType.SYS)
-            performLogin(silent = true)
-
-            val tpl = try {
-                client.newCall(Request.Builder().url("$baseUrl/template.gch").get().build())
-                    .execute().use { it.body?.string() ?: "" }
-            } catch (_: Exception) {
-                ""
+            for (p in pages) {
+                onLog("EXPORT COMPACT -> $p", LogType.SYS)
+                val html = fetchPage(p)
+                sb.append("\n==================== $p (full=${html.length}) ====================\n")
+                sb.append(sanitize(extractBodyDiv(html)))
+                sb.append("\n")
             }
-            collectMenuPages(tpl)
-            appendSection("template.gch", tpl)
-
-            val corePages = listOf(
-                "status_dsl_info_t.gch",
-                "status_wlan_info_t.gch",
-                "net_dhcp_dynamic_t.gch",
-                "IPv46_net_wan_conf_t.gch",
-                "sec_firewall_conf_t.gch",
-                "manager_dev_conf_t.gch"
-            )
-            for (p in corePages) {
-                onLog("EXPORT -> $p", LogType.SYS)
-                val html = rawGetPage(p)
-                if (!isSessionInvalid(html)) collectMenuPages(html)
-                appendSection(p, html)
-            }
-
-            appendSection("DISCOVERED_MENU_PAGES", discoveredPages.joinToString("\n"))
-
-            val extraPages = discoveredPages.filter { p ->
-                val low = p.lowercase(Locale.US)
-                p !in corePages && (
-                    low.contains("wlan") ||
-                        low.contains("wifi") ||
-                        low.contains("mac") ||
-                        low.contains("acl") ||
-                        low.contains("qos") ||
-                        low.contains("dhcp") ||
-                        low.contains("dsl") ||
-                        low.contains("dev_conf")
-                    )
-            }.take(12)
-
-            for (p in extraPages) {
-                onLog("EXPORT -> $p", LogType.ACT)
-                val html = rawGetPage(p)
-                appendSection(p, html)
-                if (isSessionInvalid(html)) {
-                    onLog("SESSION DROPPED ON $p -> RE-LOGIN", LogType.WARN)
-                    performLogin(silent = true)
-                }
-            }
-
-            onLog("EXPORT -> SECOND DHCP CHECK", LogType.SYS)
-            val dhcpSecond = rawGetPage("net_dhcp_dynamic_t.gch")
-            appendSection("SECOND_CALL_net_dhcp_dynamic_t.gch", dhcpSecond)
-
-            onLog("EXPORT READY (${sb.length / 1024} KB)", LogType.OK)
+            onLog("COMPACT EXPORT READY (${sb.length / 1024} KB)", LogType.OK)
             sb.toString()
         } catch (e: Exception) {
             onLog("EXPORT ERR: ${e.message}", LogType.ERR)
@@ -866,125 +777,18 @@ class ZteRouterClient(
         }
     }
 
-    // ===================== MENU & PAGE RESOLUTION =====================
-    private fun ensureMenuDiscovered() {
-        if (discoveredPages.any { it.contains("wlan", ignoreCase = true) && it.startsWith("net_", ignoreCase = true) }) {
-            return
-        }
-        listOf("status_wlan_info_t.gch", "IPv46_net_wan_conf_t.gch", "sec_firewall_conf_t.gch").forEach { seed ->
-            val html = fetchPage(seed)
-            if (html.isNotBlank()) collectMenuPages(html)
-        }
-    }
-
-    private fun resolveWlanBasicPage(): Pair<String, String>? {
-        val candidates = buildList {
-            wlanBasicPage?.let { add(it) }
-            addAll(discoveredPages.filter {
-                it.contains("wlan", ignoreCase = true) &&
-                    (it.contains("basic", ignoreCase = true) || it.contains("conf", ignoreCase = true))
-            })
-            addAll(listOf("net_wlan_conf1_t.gch", "net_wlan_basic_t.gch", "net_wlan_basic_11n_t.gch"))
-        }.distinct()
-
-        for (page in candidates) {
-            val html = fetchPage(page)
-            if (html.isNotBlank() && (html.contains("Standard") || html.contains("TxPower") || html.contains("Channel"))) {
-                wlanBasicPage = page
-                return page to html
-            }
-        }
-        return null
-    }
-
-    private fun resolveWlanSsidPage(): Pair<String, String>? {
-        val candidates = buildList {
-            wlanSsidPage?.let { add(it) }
-            addAll(discoveredPages.filter {
-                it.contains("wlan", ignoreCase = true) && it.contains("ssid", ignoreCase = true)
-            })
-            addAll(listOf("net_wlan_multi_ssid_t.gch", "net_wlan_ssid_t.gch", "net_wlan_conf1_t.gch"))
-        }.distinct()
-
-        for (page in candidates) {
-            val html = fetchPage(page)
-            if (html.isNotBlank() && (html.contains("ESSID") || html.contains("SSID"))) {
-                wlanSsidPage = page
-                return page to html
-            }
-        }
-        return null
-    }
-
-    private fun resolveWlanSecPage(): Pair<String, String>? {
-        val candidates = buildList {
-            wlanSecPage?.let { add(it) }
-            addAll(discoveredPages.filter {
-                it.contains("wlan", ignoreCase = true) && it.contains("sec", ignoreCase = true)
-            })
-            addAll(listOf("net_wlan_sec_t.gch", "net_wlan_security_t.gch", "net_wlan_sec_11n_t.gch"))
-        }.distinct()
-
-        for (page in candidates) {
-            val html = fetchPage(page)
-            if (html.isNotBlank() && (html.contains("KeyPassphrase") || html.contains("PreSharedKey") || html.contains("BeaconType"))) {
-                wlanSecPage = page
-                return page to html
-            }
-        }
-        return null
-    }
-
-    private fun resolveMacFilterPage(): Pair<String, String>? {
-        ensureMenuDiscovered()
-        val candidates = buildList {
-            macFilterPage?.let { add(it) }
-            addAll(discoveredPages.filter {
-                it.contains("macfilter", ignoreCase = true) ||
-                    it.contains("mac_filter", ignoreCase = true) ||
-                    it.contains("acl", ignoreCase = true)
-            })
-            addAll(listOf("net_wlan_acl_t.gch", "sec_macfilter_t.gch", "sec_mac_filter_t.gch"))
-        }.distinct()
-
-        for (page in candidates) {
-            val html = fetchPage(page)
-            if (html.isNotBlank() && (html.contains("MacAddr", ignoreCase = true) || html.contains("MACAddress", ignoreCase = true) || html.contains("ACL", ignoreCase = true))) {
-                macFilterPage = page
-                return page to html
-            }
-        }
-        return null
-    }
-
-    private fun collectMenuPages(html: String) {
-        val ignored = setOf("getpage.gch", "template.gch", "start.gch", "login.gch", "index.gch", "top.gch")
-        Regex("""([a-zA-Z0-9_]+\.gch)""").findAll(html).forEach { m ->
-            val p = m.groupValues[1]
-            if (p.lowercase(Locale.US) !in ignored) discoveredPages.add(p)
-        }
-    }
-
     // ===================== SESSION-GUARDED HTTP HELPERS =====================
     private fun fetchPage(nextPage: String, allowRelogin: Boolean = true): String {
         val body = rawGetPage(nextPage)
-        if (!isSessionInvalid(body)) {
-            collectMenuPages(body)
-            return body
-        }
+        if (!isSessionInvalid(body)) return body
 
         if (allowRelogin && !isRelogging && savedPass.isNotEmpty()) {
             isRelogging = true
             try {
-                onLog("SESSION RESET ON $nextPage -> AUTO RE-LOGIN", LogType.WARN)
+                onLog("SESSION EXPIRED ON $nextPage -> AUTO RE-LOGIN", LogType.WARN)
                 if (performLogin(silent = true)) {
                     val retry = rawGetPage(nextPage)
-                    if (!isSessionInvalid(retry)) {
-                        collectMenuPages(retry)
-                        return retry
-                    }
-                    onLog("PAGE NOT SUPPORTED: $nextPage (RESTORING SESSION)", LogType.WARN)
-                    performLogin(silent = true)
+                    if (!isSessionInvalid(retry)) return retry
                 }
             } finally {
                 isRelogging = false
@@ -1033,19 +837,16 @@ class ZteRouterClient(
 
     private fun isSessionInvalid(html: String): Boolean {
         if (html.isBlank()) return true
-        if (html.contains("Frm_Logintoken") || html.contains("Frm_Username")) return true
-        if (html.length < 1500 && (
-                html.contains("top.location", ignoreCase = true) ||
-                    html.contains("Session timeout", ignoreCase = true)
-                )
-        ) return true
+        if (html.contains("Frm_Logintoken") || html.contains("Frm_Username") || html.contains("Frm_Password")) return true
+        // كل صفحة مصادق عليها في H108N V2.5 تحتوي على session_token
+        if (!html.contains("session_token")) return true
         return false
     }
 
     private fun extractFormFields(html: String): LinkedHashMap<String, String> {
         val fields = LinkedHashMap<String, String>()
         val inputTagRegex = Regex("""(?is)<input\b[^>]*>""")
-        val nameRegex = Regex("""(?i)\bname\s*=\s*["']([^"']+)["']""")
+        val nameRegex = Regex("""(?i)\bname\s*=\s*["']?([^"'\s>]+)["']?""")
         val valueRegex = Regex("""(?i)\bvalue\s*=\s*["']([^"']*)["']""")
 
         inputTagRegex.findAll(html).forEach { tag ->
@@ -1063,14 +864,21 @@ class ZteRouterClient(
 
     // ===================== HTML & SCRIPT PARSERS =====================
     private fun parseHtmlTableRows(html: String): List<List<String>> {
-        val noStyle = html.replace(Regex("""(?is)<style[^>]*>.*?</style>"""), "")
+        val clean = html
+            .replace(Regex("""(?is)<script[^>]*>.*?</script>"""), "")
+            .replace(Regex("""(?is)<style[^>]*>.*?</style>"""), "")
+
         val rows = mutableListOf<List<String>>()
         val trRegex = Regex("""(?is)<tr[^>]*>(.*?)</tr>""")
         val cellRegex = Regex("""(?is)<t[dh][^>]*>(.*?)</t[dh]>""")
 
-        trRegex.findAll(noStyle).forEach { trMatch ->
+        trRegex.findAll(clean).forEach { trMatch ->
             val cells = cellRegex.findAll(trMatch.groupValues[1])
-                .map { cellMatch -> parseCellKeepingInlineScripts(cellMatch.groupValues[1]) }
+                .map { cellMatch ->
+                    unescapeZte(cellMatch.groupValues[1].replace(Regex("""<[^>]+>"""), " "))
+                        .replace(Regex("""\s+"""), " ")
+                        .trim()
+                }
                 .filter { it.isNotEmpty() }
                 .toList()
             if (cells.size >= 2) rows.add(cells)
@@ -1078,34 +886,9 @@ class ZteRouterClient(
         return rows
     }
 
-    private fun parseCellKeepingInlineScripts(cellHtml: String): String {
-        val resolved = Regex("""(?is)<script[^>]*>(.*?)</script>""").replace(cellHtml) { match ->
-            val script = match.groupValues[1]
-            val divMatch = Regex("""['"]?(-?\d+(?:\.\d+)?)['"]?\s*\)\s*/\s*10|(-?\d+(?:\.\d+)?)\s*/\s*10""").find(script)
-            if (divMatch != null) {
-                val rawNum = (divMatch.groupValues[1].ifEmpty { divMatch.groupValues[2] }).toDoubleOrNull()
-                if (rawNum != null) return@replace String.format(Locale.US, "%.1f", rawNum / 10.0)
-            }
-            val writeMatch = Regex("""document\.write\(\s*['"]([^'"]+)['"]\s*\)""").find(script)
-            if (writeMatch != null) return@replace writeMatch.groupValues[1]
-            ""
-        }
-        return unescapeZte(resolved.replace(Regex("""<[^>]+>"""), " "))
-            .replace(Regex("""\s+"""), " ")
-            .trim()
-    }
-
     private fun extractNumberPair(text: String): Pair<String, String>? {
         val m = Regex("""(-?\d+(?:\.\d+)?)\s*/\s*(-?\d+(?:\.\d+)?)""").find(text) ?: return null
         return m.groupValues[1] to m.groupValues[2]
-    }
-
-    private fun extractJsVar(html: String, vararg names: String): String? {
-        for (name in names) {
-            val r = Regex("""(?i)\b$name\b\s*=\s*['"]?(-?\d+(?:\.\d+)?)['"]?""")
-            r.find(html)?.groupValues?.get(1)?.let { return it }
-        }
-        return null
     }
 
     private fun parseTransferMeaning(html: String): Map<String, String> {
@@ -1119,10 +902,9 @@ class ZteRouterClient(
 
     private fun extractSessionToken(html: String): String? {
         val patterns = listOf(
-            Regex("""_SESSION_TOKEN\s*=\s*["']([^"']+)["']"""),
             Regex("""session_token\s*=\s*["']([^"']+)["']"""),
-            Regex("""name=["']_SESSION_TOKEN["'][^>]*value=["']([^"']+)["']"""),
-            Regex("""Transfer_meaning\(\s*['"]_SESSION_TOKEN['"]\s*,\s*['"]([^'"]+)['"]\s*\)""")
+            Regex("""_SESSION_TOKEN\s*=\s*["']([^"']+)["']"""),
+            Regex("""name=["']_SESSION_TOKEN["'][^>]*value=["']([^"']+)["']""")
         )
         for (p in patterns) {
             p.find(html)?.groupValues?.get(1)?.let { if (it.isNotBlank()) return it }
@@ -1150,19 +932,11 @@ class ZteRouterClient(
         return out.trim()
     }
 
-    private fun cleanNum(raw: String): String {
-        val v = raw.trim()
-        if (v.isEmpty()) return "--"
-        return v.replace(Regex("""\s*kbps$""", RegexOption.IGNORE_CASE), "")
-    }
+    private fun formatTenthsDb(raw: String?): String = formatTenthsUnit(raw, "dB")
 
-    private fun formatDb(raw: String?): String {
-        val v = raw?.trim().orEmpty()
-        if (v.isEmpty()) return "--"
-        if (v.contains("dB", ignoreCase = true)) return v
-        if (v.contains(".")) return "$v dB"
-        val num = v.toDoubleOrNull() ?: return v
-        return if (num > 50.0) String.format(Locale.US, "%.1f dB", num / 10.0) else "$v dB"
+    private fun formatTenthsUnit(raw: String?, unit: String): String {
+        val num = raw?.trim()?.toDoubleOrNull() ?: return "--"
+        return String.format(Locale.US, "%.1f %s", num / 10.0, unit)
     }
 
     private fun formatLease(raw: String?): String {
