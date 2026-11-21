@@ -7,6 +7,7 @@ import android.net.NetworkCapabilities
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import okhttp3.ConnectionPool
 import okhttp3.ConnectionSpec
 import okhttp3.Cookie
 import okhttp3.CookieJar
@@ -87,7 +88,16 @@ class ZteRouterClient(
     private val onLog: (String, LogType) -> Unit
 ) {
     companion object {
-        // المسارات الفعلية المستخرجة من قائمة ZXHN H108N V2.5
+        init {
+            // تعطيل شرط close_notify قبل تحميل كلاسات BouncyCastle JSSE لتوافق راوترات ZTE
+            System.setProperty("com.sun.net.ssl.requireCloseNotify", "false")
+            try {
+                Security.setProperty("jdk.tls.disabledAlgorithms", "")
+                Security.setProperty("jdk.certpath.disabledAlgorithms", "")
+            } catch (_: Exception) {
+            }
+        }
+
         private const val PAGE_DSL = "status_dsl_info_t.gch"
         private const val PAGE_DHCP = "net_dhcp_dynamic_t.gch"
         private const val PAGE_WLAN_BASIC = "net_11n_conf_t.gch"
@@ -108,11 +118,7 @@ class ZteRouterClient(
     private var isRelogging: Boolean = false
 
     private val bcJsseProvider: BouncyCastleJsseProvider by lazy {
-        try {
-            Security.setProperty("jdk.tls.disabledAlgorithms", "")
-            Security.setProperty("jdk.certpath.disabledAlgorithms", "")
-        } catch (_: Exception) {
-        }
+        System.setProperty("com.sun.net.ssl.requireCloseNotify", "false")
         BouncyCastleJsseProvider(BouncyCastleProvider())
     }
 
@@ -181,7 +187,10 @@ class ZteRouterClient(
 
         val builder = OkHttpClient.Builder()
             .connectTimeout(8, TimeUnit.SECONDS)
-            .readTimeout(12, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
+            .writeTimeout(10, TimeUnit.SECONDS)
+            .connectionPool(ConnectionPool(0, 1, TimeUnit.SECONDS))
+            .retryOnConnectionFailure(true)
             .protocols(listOf(Protocol.HTTP_1_1))
             .connectionSpecs(listOf(tlsSpec, ConnectionSpec.CLEARTEXT))
             .sslSocketFactory(
@@ -260,13 +269,15 @@ class ZteRouterClient(
 
             if (!silent) onLog("CONNECT -> $baseUrl (BC TLS 1.0)", LogType.SYS)
             val initHtml = try {
-                client.newCall(Request.Builder().url("$baseUrl/").get().build())
-                    .execute().use { it.body?.string() ?: "" }
+                client.newCall(
+                    Request.Builder().url("$baseUrl/").header("Connection", "close").get().build()
+                ).execute().use { it.body?.string() ?: "" }
             } catch (_: Exception) {
                 baseUrl = "http://$cleanHost"
                 if (!silent) onLog("FALLBACK -> $baseUrl", LogType.WARN)
-                client.newCall(Request.Builder().url("$baseUrl/").get().build())
-                    .execute().use { it.body?.string() ?: "" }
+                client.newCall(
+                    Request.Builder().url("$baseUrl/").header("Connection", "close").get().build()
+                ).execute().use { it.body?.string() ?: "" }
             }
 
             if (initHtml.isEmpty()) {
@@ -289,7 +300,7 @@ class ZteRouterClient(
                 .build()
 
             val respHtml = client.newCall(
-                Request.Builder().url("$baseUrl/").post(form).build()
+                Request.Builder().url("$baseUrl/").header("Connection", "close").post(form).build()
             ).execute().use { it.body?.string() ?: "" }
 
             val ok = respHtml.isNotEmpty() &&
@@ -325,7 +336,6 @@ class ZteRouterClient(
             var maxDown = "--"
             var maxUp = "--"
 
-            // قراءة قيم SNR والتوهين من الحقول المخفية وقسمتها على 10 مثل pageGetValues() في الراوتر
             val upSnr = formatTenthsDb(hiddenInputs["Upstream_noise_margin"])
             val downSnr = formatTenthsDb(hiddenInputs["Downstream_noise_margin"])
             val upAttn = formatTenthsDb(hiddenInputs["Upstream_attenuation"])
@@ -387,7 +397,6 @@ class ZteRouterClient(
             var html = fetchPage(PAGE_DHCP)
             var map = parseTransferMeaning(html)
 
-            // إذا لم تظهر علامة IF_INSTNUM، نعيد تسجيل الدخول مرة واحدة تلقائياً
             if (!map.containsKey("IF_INSTNUM") && savedPass.isNotEmpty()) {
                 onLog("STALE DHCP RESPONSE -> RE-LOGIN & RETRY", LogType.WARN)
                 if (performLogin(silent = true)) {
@@ -461,7 +470,7 @@ class ZteRouterClient(
                 return@withContext false
             }
 
-            // أولاً: تفعيل وضع الحظر (Discard / Block) إذا كان ACL Policy متاحاً ومعطلاً
+            // تفعيل وضع الحظر (Discard / Block) إن كان معطلاً في ACL Policy
             val initFields = extractFormFields(html)
             val policyKey = listOf("ACLPolicy", "Policy", "Mode").firstOrNull { initFields.containsKey(it) }
             if (policyKey != null && initFields[policyKey] != "Discard" && initFields[policyKey] != "2") {
@@ -475,7 +484,6 @@ class ZteRouterClient(
                 postForm(PAGE_WLAN_MAC_FILTER, policyForm)
             }
 
-            // جلب توكن جديد لإضافة عنوان الـ MAC
             val freshHtml = fetchPage(PAGE_WLAN_MAC_FILTER)
             val freshToken = extractSessionToken(freshHtml) ?: token
             val fields = extractFormFields(freshHtml)
@@ -617,7 +625,7 @@ class ZteRouterClient(
             }
             fields["_SESSION_TOKEN"] = token
 
-            val ok = postForm(PAGE_WLAN_SEC, fields)
+            val ok = postForm(PAGE_WLAN_SEC, fields, tolerateRadioReset = true)
             onLog(if (ok) "WI-FI PASSWORD UPDATED" else "PASSWORD UPDATE FAILED", if (ok) LogType.OK else LogType.ERR)
             ok
         } catch (e: Exception) {
@@ -650,7 +658,7 @@ class ZteRouterClient(
             if (fields.containsKey("ESSIDHideEnable0")) fields["ESSIDHideEnable0"] = if (hideSsid) "1" else "0"
             fields["_SESSION_TOKEN"] = token
 
-            val ok = postForm(PAGE_WLAN_SSID, fields)
+            val ok = postForm(PAGE_WLAN_SSID, fields, tolerateRadioReset = true)
             onLog(if (ok) "SSID SETTINGS SAVED" else "SSID UPDATE FAILED", if (ok) LogType.OK else LogType.ERR)
             ok
         } catch (e: Exception) {
@@ -683,7 +691,7 @@ class ZteRouterClient(
                 if (fields.containsKey("BasicDataRates")) fields["BasicDataRates"] = preset.dataRate
                 fields["_SESSION_TOKEN"] = token
 
-                val ok = postForm(PAGE_WLAN_BASIC, fields)
+                val ok = postForm(PAGE_WLAN_BASIC, fields, tolerateRadioReset = true)
                 onLog(
                     if (ok) "SPEED PROFILE APPLIED (${preset.title})" else "SPEED PROFILE FAILED",
                     if (ok) LogType.OK else LogType.ERR
@@ -713,7 +721,7 @@ class ZteRouterClient(
                 "flag" to "1",
                 "_SESSION_TOKEN" to token
             )
-            val ok = postForm(PAGE_REBOOT, fields)
+            val ok = postForm(PAGE_REBOOT, fields, tolerateRadioReset = true)
             onLog(if (ok) "REBOOT TRANSMITTED" else "REBOOT FAILED", if (ok) LogType.OK else LogType.ERR)
             ok
         } catch (e: Exception) {
@@ -722,7 +730,7 @@ class ZteRouterClient(
         }
     }
 
-    // ===================== 6. COMPACT FORMS EXPORTER (NO CSS BOILERPLATE) =====================
+    // ===================== 6. COMPACT FORMS EXPORTER =====================
     suspend fun exportRouterHtmlDump(): String = withContext(Dispatchers.IO) {
         if (savedPass.isEmpty()) {
             onLog("EXPORT: CONNECT TO ROUTER FIRST", LogType.WARN)
@@ -802,6 +810,7 @@ class ZteRouterClient(
             val req = Request.Builder()
                 .url("$baseUrl/getpage.gch?pid=1002&nextpage=$nextPage")
                 .header("Referer", "$baseUrl/template.gch")
+                .header("Connection", "close")
                 .get()
                 .build()
             client.newCall(req).execute().use { it.body?.string() ?: "" }
@@ -810,7 +819,11 @@ class ZteRouterClient(
         }
     }
 
-    private fun postForm(nextPage: String, fields: Map<String, String>): Boolean {
+    private fun postForm(
+        nextPage: String,
+        fields: Map<String, String>,
+        tolerateRadioReset: Boolean = false
+    ): Boolean {
         val form = FormBody.Builder().apply {
             fields.forEach { (k, v) -> add(k, v) }
         }.build()
@@ -818,45 +831,73 @@ class ZteRouterClient(
         val req = Request.Builder()
             .url("$baseUrl/getpage.gch?pid=1002&nextpage=$nextPage")
             .header("Referer", "$baseUrl/getpage.gch?pid=1002&nextpage=$nextPage")
+            .header("Connection", "close")
             .post(form)
             .build()
 
-        return client.newCall(req).execute().use { resp ->
-            val body = resp.body?.string() ?: ""
-            if (!resp.isSuccessful || isSessionInvalid(body)) {
-                if (savedPass.isNotEmpty() && !isRelogging) {
-                    isRelogging = true
-                    try { performLogin(silent = true) } finally { isRelogging = false }
+        return try {
+            client.newCall(req).execute().use { resp ->
+                val body = resp.body?.string() ?: ""
+                if (!resp.isSuccessful || isSessionInvalid(body)) {
+                    if (savedPass.isNotEmpty() && !isRelogging) {
+                        isRelogging = true
+                        try { performLogin(silent = true) } finally { isRelogging = false }
+                    }
+                    return@use false
                 }
-                return@use false
+                val parsed = parseTransferMeaning(body)
+                val err = parsed["IF_ERRORSTR"]
+                val param = parsed["IF_ERRORPARAM"]
+                val ok = err == null || err.equals("SUCC", ignoreCase = true) || err.isBlank()
+                if (!ok) {
+                    onLog("ROUTER REJECT ($nextPage): ERR=$err, PARAM=$param", LogType.ERR)
+                }
+                ok
             }
-            val err = parseTransferMeaning(body)["IF_ERRORSTR"]
-            err == null || err.equals("SUCC", ignoreCase = true) || err.isBlank()
+        } catch (e: Exception) {
+            val msg = e.message.orEmpty()
+            // عند تعديل الواي فاي أو إعادة التشغيل قد يعيد الراوتر تشغيل البث قبل إتمام الرد
+            if (tolerateRadioReset && (
+                    msg.contains("close_notify", ignoreCase = true) ||
+                        msg.contains("Software caused connection abort", ignoreCase = true) ||
+                        msg.contains("Connection reset", ignoreCase = true)
+                    )
+            ) {
+                onLog("WIFI RADIO RESTARTED DURING APPLY (COMMAND SENT)", LogType.WARN)
+                true
+            } else {
+                throw e
+            }
         }
     }
 
     private fun isSessionInvalid(html: String): Boolean {
         if (html.isBlank()) return true
         if (html.contains("Frm_Logintoken") || html.contains("Frm_Username") || html.contains("Frm_Password")) return true
-        // كل صفحة مصادق عليها في H108N V2.5 تحتوي على session_token
         if (!html.contains("session_token")) return true
         return false
     }
 
+    // استخراج الحقول من نموذج fSubmit فقط دون التقاط flogout أو fLogin أو Frm_*
     private fun extractFormFields(html: String): LinkedHashMap<String, String> {
         val fields = LinkedHashMap<String, String>()
+        val fSubmitRegex = Regex("""(?is)<form\b[^>]*\b(?:id|name)\s*=\s*["']?fSubmit["']?[^>]*>(.*?)</form>""")
+        val scopeHtml = fSubmitRegex.find(html)?.groupValues?.get(1) ?: html
+
         val inputTagRegex = Regex("""(?is)<input\b[^>]*>""")
         val nameRegex = Regex("""(?i)\bname\s*=\s*["']?([^"'\s>]+)["']?""")
         val valueRegex = Regex("""(?i)\bvalue\s*=\s*["']([^"']*)["']""")
+        val excluded = setOf("logout", "_toplang", "IF_UPLOADING", "Submit")
 
-        inputTagRegex.findAll(html).forEach { tag ->
+        inputTagRegex.findAll(scopeHtml).forEach { tag ->
             val t = tag.value
             val name = nameRegex.find(t)?.groupValues?.get(1) ?: return@forEach
+            if (name in excluded || name.startsWith("Frm_")) return@forEach
             val value = valueRegex.find(t)?.groupValues?.get(1) ?: ""
             fields[name] = unescapeZte(value)
         }
 
-        parseTransferMeaning(html).forEach { (k, v) ->
+        parseTransferMeaning(scopeHtml).forEach { (k, v) ->
             if (fields.containsKey(k)) fields[k] = v
         }
         return fields
