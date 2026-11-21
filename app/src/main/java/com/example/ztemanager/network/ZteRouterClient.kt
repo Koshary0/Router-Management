@@ -87,6 +87,11 @@ class ZteRouterClient(
     private var baseUrl: String = "http://192.168.1.1"
     private var targetHost: String = "192.168.1.1"
 
+    private var discoveredPages: List<String> = emptyList()
+    private var lastDslPage: String = "none"
+    private var lastDslPreview: String = ""
+    private var lastDhcpSample: Map<String, String> = emptyMap()
+
     private val bcJsseProvider: BouncyCastleJsseProvider by lazy {
         try {
             Security.setProperty("jdk.tls.disabledAlgorithms", "")
@@ -243,6 +248,10 @@ class ZteRouterClient(
 
     fun clearSession() {
         cookieStore.clear()
+        discoveredPages = emptyList()
+        lastDslPage = "none"
+        lastDslPreview = ""
+        lastDhcpSample = emptyMap()
         onLog("SESSION CLEARED BY USER", LogType.WARN)
     }
 
@@ -251,6 +260,7 @@ class ZteRouterClient(
             try {
                 setRouterIp(ip)
                 cookieStore.clear()
+                discoveredPages = emptyList()
 
                 var initHtml = ""
                 var needsHttpsProbe = baseUrl.startsWith("https://")
@@ -284,15 +294,6 @@ class ZteRouterClient(
                 }
 
                 if (needsHttpsProbe) {
-                    val bcProtocols = try {
-                        SSLContext.getInstance("TLS", bcJsseProvider)
-                            .apply { init(null, null, SecureRandom()) }
-                            .supportedSSLParameters.protocols.joinToString(", ")
-                    } catch (e: Exception) {
-                        "err: ${e.message}"
-                    }
-                    onLog("BCTLS ENGINE PROTOCOLS: [$bcProtocols]", LogType.SYS)
-
                     var lastErr: String? = null
                     for (mode in TlsMode.entries) {
                         try {
@@ -364,6 +365,13 @@ class ZteRouterClient(
 
                 if (success) {
                     onLog("AUTH SUCCESS -> SESSION ESTABLISHED", LogType.OK)
+                    discoverPagesFromHtml(responseHtml)
+                    try {
+                        val tplHtml = fetchRawPath("/template.gch")
+                        discoverPagesFromHtml(tplHtml)
+                        onLog("DISCOVERED ${discoveredPages.size} ROUTER .gch PAGES", LogType.SYS)
+                    } catch (_: Exception) {
+                    }
                 } else {
                     onLog("AUTH REJECTED -> CHECK CREDENTIALS OR FIRMWARE", LogType.ERR)
                 }
@@ -376,23 +384,88 @@ class ZteRouterClient(
 
     suspend fun getDslStats(): DslStats = withContext(Dispatchers.IO) {
         try {
-            onLog("FETCHING -> status_dsl_info_t.gch", LogType.SYS)
-            val html = fetchPage("status_dsl_info_t.gch")
-            val map = parseTransferMeaning(html)
-            onLog("PARSED ${map.size} DSL TELEMETRY KEYS", LogType.OK)
+            val discoveredDsl = discoveredPages.filter {
+                it.contains("dsl", ignoreCase = true) ||
+                    (it.contains("status", ignoreCase = true) && it.contains("wan", ignoreCase = true))
+            }
+            val fallbackDsl = listOf(
+                "status_wan_dsl_t.gch",
+                "status_dsl_t.gch",
+                "status_adsl_t.gch",
+                "status_dsl_info_t.gch",
+                "status_net_dsl_t.gch",
+                "status_wan_adsl_t.gch",
+                "status_wan_if_t.gch"
+            )
+            val candidates = (discoveredDsl + fallbackDsl).distinct()
+
+            var bestMap: Map<String, String> = emptyMap()
+            var matchedPage = "none"
+
+            for (page in candidates) {
+                onLog("TRYING DSL PAGE -> $page", LogType.SYS)
+                val html = fetchPage(page)
+                if (html.isBlank()) continue
+
+                val map = parseTransferMeaning(html)
+                val hasDslData = map.keys.any { k ->
+                    k.contains("Rate", ignoreCase = true) ||
+                        k.contains("Noise", ignoreCase = true) ||
+                        k.contains("Snr", ignoreCase = true) ||
+                        k.contains("Atten", ignoreCase = true) ||
+                        k.contains("Modulation", ignoreCase = true) ||
+                        k.contains("LinkStatus", ignoreCase = true)
+                }
+
+                if (hasDslData) {
+                    bestMap = map
+                    matchedPage = page
+                    onLog("MATCHED DSL PAGE: $page (${map.size} keys)", LogType.OK)
+                    break
+                } else if (map.size > bestMap.size) {
+                    bestMap = map
+                    matchedPage = page
+                } else if (lastDslPreview.isEmpty() && html.length > 40) {
+                    lastDslPreview = html
+                        .replace(Regex("""\s+"""), " ")
+                        .take(280)
+                }
+            }
+
+            lastDslPage = matchedPage
+            if (bestMap.isEmpty()) {
+                onLog("NO DSL KEYS FOUND ACROSS ${candidates.size} PAGES -> TAP DUMP KEYS", LogType.WARN)
+                return@withContext DslStats()
+            }
 
             DslStats(
-                status = map["LinkStatus"] ?: map["ModulationType"] ?: "Connected",
-                downRateKbps = map["DownstreamCurrRate"] ?: "--",
-                upRateKbps = map["UpstreamCurrRate"] ?: "--",
-                maxDownKbps = map["DownstreamMaxRate"] ?: "--",
-                maxUpKbps = map["UpstreamMaxRate"] ?: "--",
-                downSnrDb = formatTenths(map["DownstreamNoiseMargin"]),
-                upSnrDb = formatTenths(map["UpstreamNoiseMargin"]),
-                downAttnDb = formatTenths(map["DownstreamAttenuation"]),
-                upAttnDb = formatTenths(map["UpstreamAttenuation"]),
-                uptime = map["UpTime"] ?: "--",
-                rawMap = map
+                status = findKey(bestMap, "LinkStatus", "Status", "AdslStatus", "LineStatus", "ModulationType") ?: "Connected",
+                downRateKbps = formatRateNumber(
+                    findKey(bestMap, "DownstreamCurrRate", "DownCurrRate", "ActDataRateDown", "CurrentDownRate", "DownstreamRate", "DownRate")
+                ),
+                upRateKbps = formatRateNumber(
+                    findKey(bestMap, "UpstreamCurrRate", "UpCurrRate", "ActDataRateUp", "CurrentUpRate", "UpstreamRate", "UpRate")
+                ),
+                maxDownKbps = formatRateNumber(
+                    findKey(bestMap, "DownstreamMaxRate", "DownMaxRate", "MaxDownRate", "AttainableDownRate")
+                ),
+                maxUpKbps = formatRateNumber(
+                    findKey(bestMap, "UpstreamMaxRate", "UpMaxRate", "MaxUpRate", "AttainableUpRate")
+                ),
+                downSnrDb = formatDb(
+                    findKey(bestMap, "DownstreamNoiseMargin", "DownNoiseMargin", "SnrDown", "NoiseMarginDown")
+                ),
+                upSnrDb = formatDb(
+                    findKey(bestMap, "UpstreamNoiseMargin", "UpNoiseMargin", "SnrUp", "NoiseMarginUp")
+                ),
+                downAttnDb = formatDb(
+                    findKey(bestMap, "DownstreamAttenuation", "DownAttenuation", "AttnDown", "LineAttenuationDown")
+                ),
+                upAttnDb = formatDb(
+                    findKey(bestMap, "UpstreamAttenuation", "UpAttenuation", "AttnUp", "LineAttenuationUp")
+                ),
+                uptime = findKey(bestMap, "UpTime", "ShowtimeStart", "LinkUpTime") ?: "--",
+                rawMap = bestMap
             )
         } catch (e: Exception) {
             onLog("DSL FETCH FAILED: ${e.message}", LogType.ERR)
@@ -402,9 +475,14 @@ class ZteRouterClient(
 
     suspend fun getConnectedDevices(): List<ConnectedDevice> = withContext(Dispatchers.IO) {
         try {
-            onLog("SCANNING DHCP -> net_dhcp_dynamic_t.gch", LogType.SYS)
-            val html = fetchPage("net_dhcp_dynamic_t.gch")
+            val dhcpPage = discoveredPages.firstOrNull {
+                it.contains("dhcp_dynamic", ignoreCase = true)
+            } ?: "net_dhcp_dynamic_t.gch"
+
+            onLog("SCANNING DHCP -> $dhcpPage", LogType.SYS)
+            val html = fetchPage(dhcpPage)
             val map = parseTransferMeaning(html)
+            lastDhcpSample = map.entries.take(12).associate { it.key to it.value }
 
             val indices = map.keys
                 .mapNotNull {
@@ -414,17 +492,25 @@ class ZteRouterClient(
                 .sorted()
 
             val devices = indices.mapNotNull { idx ->
-                val mac = map["MACAddr$idx"].orEmpty()
+                val mac = map["MACAddr$idx"].orEmpty().uppercase(Locale.US)
                 val ip = map["IPAddr$idx"].orEmpty()
                 if (mac.isBlank() && ip.isBlank()) return@mapNotNull null
+
+                val rawName = map["HostName$idx"].orEmpty().trim()
+                val cleanName = if (rawName.isBlank() || rawName == "*" || rawName == "null") {
+                    "Device ($ip)"
+                } else {
+                    rawName
+                }
+
                 ConnectedDevice(
-                    hostName = map["HostName$idx"]?.ifBlank { "Unnamed Device" } ?: "Unnamed Device",
+                    hostName = cleanName,
                     ipAddress = ip.ifBlank { "--" },
                     macAddress = mac.ifBlank { "--" },
-                    leaseTime = map["ExpiredTime$idx"]?.let { "${it}s" } ?: "--"
+                    leaseTime = formatLease(map["ExpiredTime$idx"])
                 )
             }
-            onLog("FOUND ${devices.size} ACTIVE DHCP CLIENTS", LogType.OK)
+            onLog("FOUND ${devices.size} ACTIVE DHCP CLIENTS (DECODED)", LogType.OK)
             devices
         } catch (e: Exception) {
             onLog("DEVICE SCAN FAILED: ${e.message}", LogType.ERR)
@@ -434,28 +520,33 @@ class ZteRouterClient(
 
     suspend fun blockMacAddress(mac: String, alias: String): Boolean = withContext(Dispatchers.IO) {
         try {
-            onLog("BLOCKING MAC ($mac) -> sec_macfilter_t.gch", LogType.ACT)
-            val pageHtml = fetchPage("sec_macfilter_t.gch")
+            val macPage = discoveredPages.firstOrNull {
+                it.contains("macfilter", ignoreCase = true) || it.contains("mac_filter", ignoreCase = true)
+            } ?: "sec_macfilter_t.gch"
+
+            onLog("BLOCKING MAC ($mac) -> $macPage", LogType.ACT)
+            val pageHtml = fetchPage(macPage)
             val token = extractSessionToken(pageHtml)
             if (token == null) {
-                onLog("MISSING _SESSION_TOKEN ON MAC FILTER PAGE", LogType.ERR)
+                onLog("MISSING _SESSION_TOKEN ON $macPage", LogType.ERR)
                 return@withContext false
             }
 
+            val cleanAlias = alias.replace(Regex("""[^a-zA-Z0-9_-]"""), "").take(15).ifBlank { "Blocked" }
             val form = FormBody.Builder()
                 .add("IF_ACTION", "new")
                 .add("IF_ERRORSTR", "SUCC")
                 .add("IF_ERRORPARAM", "SUCC")
                 .add("IF_ERRORTYPE", "-1")
                 .add("Enable", "1")
-                .add("Name", alias.take(15).ifBlank { "Blocked" })
+                .add("Name", cleanAlias)
                 .add("SrcMacAddr", mac)
                 .add("DstMacAddr", "")
                 .add("_SESSION_TOKEN", token)
                 .build()
 
             val req = Request.Builder()
-                .url("$baseUrl/getpage.gch?pid=1002&nextpage=sec_macfilter_t.gch")
+                .url("$baseUrl/getpage.gch?pid=1002&nextpage=$macPage")
                 .post(form)
                 .build()
 
@@ -473,11 +564,15 @@ class ZteRouterClient(
 
     suspend fun rebootRouter(): Boolean = withContext(Dispatchers.IO) {
         try {
-            onLog("REQUESTING REBOOT -> manager_dev_conf_t.gch", LogType.WARN)
-            val pageHtml = fetchPage("manager_dev_conf_t.gch")
+            val rebootPage = discoveredPages.firstOrNull {
+                it.contains("dev_conf", ignoreCase = true) || it.contains("restart", ignoreCase = true)
+            } ?: "manager_dev_conf_t.gch"
+
+            onLog("REQUESTING REBOOT -> $rebootPage", LogType.WARN)
+            val pageHtml = fetchPage(rebootPage)
             val token = extractSessionToken(pageHtml)
             if (token == null) {
-                onLog("FAILED TO EXTRACT _SESSION_TOKEN", LogType.ERR)
+                onLog("FAILED TO EXTRACT _SESSION_TOKEN ON $rebootPage", LogType.ERR)
                 return@withContext false
             }
 
@@ -491,7 +586,7 @@ class ZteRouterClient(
                 .build()
 
             val req = Request.Builder()
-                .url("$baseUrl/getpage.gch?pid=1002&nextpage=manager_dev_conf_t.gch")
+                .url("$baseUrl/getpage.gch?pid=1002&nextpage=$rebootPage")
                 .post(form)
                 .build()
 
@@ -507,6 +602,54 @@ class ZteRouterClient(
         }
     }
 
+    fun getDiagnosticLines(dslRawMap: Map<String, String>): List<Pair<String, LogType>> {
+        val out = mutableListOf<Pair<String, LogType>>()
+        out.add("--- DIAGNOSTICS (DSL PAGE: $lastDslPage) ---" to LogType.ACT)
+
+        if (discoveredPages.isNotEmpty()) {
+            out.add("DISCOVERED PAGES (${discoveredPages.size}):" to LogType.OK)
+            discoveredPages.chunked(3).forEach { chunk ->
+                out.add("  " + chunk.joinToString(" | ") to LogType.SYS)
+            }
+        } else {
+            out.add("NO MENU PAGES DISCOVERED YET" to LogType.WARN)
+        }
+
+        if (dslRawMap.isNotEmpty()) {
+            out.add("DSL KEYS (${dslRawMap.size}):" to LogType.OK)
+            dslRawMap.entries.take(35).forEach { (k, v) ->
+                out.add("  $k = $v" to LogType.SYS)
+            }
+        } else if (lastDslPreview.isNotEmpty()) {
+            out.add("DSL HTML PREVIEW: $lastDslPreview" to LogType.WARN)
+        }
+
+        if (lastDhcpSample.isNotEmpty()) {
+            out.add("DHCP SAMPLE:" to LogType.OK)
+            lastDhcpSample.forEach { (k, v) ->
+                out.add("  $k = $v" to LogType.SYS)
+            }
+        }
+        return out
+    }
+
+    private fun discoverPagesFromHtml(html: String) {
+        val ignored = setOf("getpage.gch", "template.gch", "start.gch", "login.gch", "index.gch")
+        val found = Regex("""([a-zA-Z0-9_]+\.gch)""").findAll(html)
+            .map { it.groupValues[1] }
+            .filterNot { it.lowercase(Locale.US) in ignored }
+            .distinct()
+            .toList()
+        if (found.isNotEmpty()) {
+            discoveredPages = (discoveredPages + found).distinct()
+        }
+    }
+
+    private fun fetchRawPath(path: String): String {
+        val req = Request.Builder().url("$baseUrl$path").get().build()
+        return client.newCall(req).execute().use { it.body?.string() ?: "" }
+    }
+
     private fun fetchPage(nextPage: String): String {
         val req = Request.Builder()
             .url("$baseUrl/getpage.gch?pid=1002&nextpage=$nextPage")
@@ -519,9 +662,48 @@ class ZteRouterClient(
         val result = mutableMapOf<String, String>()
         val pattern = Regex("""Transfer_meaning\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]*)['"]\s*\)""")
         pattern.findAll(html).forEach { match ->
-            result[match.groupValues[1]] = match.groupValues[2]
+            val key = unescapeZteValue(match.groupValues[1])
+            val value = unescapeZteValue(match.groupValues[2])
+            result[key] = value
         }
         return result
+    }
+
+    // فك ترميز نصوص ZTE مثل \x2d (-) و \x3a (:) و \x20 (مسافة)
+    private fun unescapeZteValue(raw: String): String {
+        var out = raw
+        out = Regex("""\\x([0-9a-fA-F]{2})""").replace(out) { m ->
+            m.groupValues[1].toInt(16).toChar().toString()
+        }
+        out = Regex("""\\u([0-9a-fA-F]{4})""").replace(out) { m ->
+            m.groupValues[1].toInt(16).toChar().toString()
+        }
+        out = out
+            .replace("\\'", "'")
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&nbsp;", " ")
+        out = Regex("""&#(\d+);""").replace(out) { m ->
+            m.groupValues[1].toIntOrNull()?.toChar()?.toString() ?: m.value
+        }
+        return out.trim()
+    }
+
+    private fun findKey(map: Map<String, String>, vararg candidates: String): String? {
+        for (c in candidates) {
+            map[c]?.takeIf { it.isNotBlank() }?.let { return it }
+            map["${c}0"]?.takeIf { it.isNotBlank() }?.let { return it }
+            map.entries.firstOrNull { it.key.equals(c, ignoreCase = true) && it.value.isNotBlank() }
+                ?.let { return it.value }
+            map.entries.firstOrNull { it.key.equals("${c}0", ignoreCase = true) && it.value.isNotBlank() }
+                ?.let { return it.value }
+        }
+        return null
     }
 
     private fun extractSessionToken(html: String): String? {
@@ -536,9 +718,26 @@ class ZteRouterClient(
         return null
     }
 
-    private fun formatTenths(raw: String?): String {
-        val num = raw?.toDoubleOrNull() ?: return "--"
+    private fun formatRateNumber(raw: String?): String {
+        val v = raw?.trim().orEmpty()
+        if (v.isEmpty()) return "--"
+        return v.replace(Regex("""\s*kbps$""", RegexOption.IGNORE_CASE), "")
+    }
+
+    private fun formatDb(raw: String?): String {
+        val v = raw?.trim().orEmpty()
+        if (v.isEmpty()) return "--"
+        if (v.contains("dB", ignoreCase = true)) return v
+        if (v.contains(".")) return "$v dB"
+        val num = v.toDoubleOrNull() ?: return v
         return String.format(Locale.US, "%.1f dB", num / 10.0)
+    }
+
+    private fun formatLease(raw: String?): String {
+        val sec = raw?.toLongOrNull() ?: return raw?.ifBlank { "--" } ?: "--"
+        val h = sec / 3600
+        val m = (sec % 3600) / 60
+        return if (h > 0) "${h}h ${m}m" else "${m}m"
     }
 
     private fun sha256(input: String): String {

@@ -183,14 +183,9 @@ fun RouterStudioApp() {
                 2 -> TerminalTab(
                     logs = terminalLogs,
                     onClear = { terminalLogs.clear() },
-                    onDumpKeys = {
-                        if (dslStats.rawMap.isEmpty()) {
-                            addLog("NO CACHED KEYS YET - CONNECT FIRST", LogType.WARN)
-                        } else {
-                            addLog("--- RAW DSL KEYS (${dslStats.rawMap.size}) ---", LogType.ACT)
-                            dslStats.rawMap.entries.take(30).forEach { (k, v) ->
-                                addLog("$k = $v", LogType.SYS)
-                            }
+                                        onDumpKeys = {
+                        routerClient.getDiagnosticLines(dslStats.rawMap).forEach { (msg, type) ->
+                            addLog(msg, type)
                         }
                     }
                 )
