@@ -3,7 +3,9 @@ package com.example.ztemanager
 import android.content.Context
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -70,7 +72,7 @@ fun RouterStudioApp() {
     val scope = rememberCoroutineScope()
     val prefs = remember { context.getSharedPreferences("zte_router_prefs", Context.MODE_PRIVATE) }
 
-    var activeTab by remember { mutableIntStateOf(4) } // Setup tab initially
+    var activeTab by remember { mutableIntStateOf(4) }
     var isConnected by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(false) }
     var loaderMessage by remember { mutableStateOf("Connecting...") }
@@ -92,6 +94,24 @@ fun RouterStudioApp() {
     fun addLog(msg: String, type: LogType) {
         val time = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
         terminalLogs.add(TerminalEntry(time, msg, type))
+    }
+
+    var pendingExportText by remember { mutableStateOf<String?>(null) }
+    val exportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("text/plain")
+    ) { uri ->
+        val data = pendingExportText
+        if (uri != null && data != null) {
+            try {
+                context.contentResolver.openOutputStream(uri)?.use { out ->
+                    out.write(data.toByteArray(Charsets.UTF_8))
+                }
+                addLog("FILE SAVED (${data.length / 1024} KB)", LogType.OK)
+            } catch (e: Exception) {
+                addLog("SAVE ERR: ${e.message}", LogType.ERR)
+            }
+        }
+        pendingExportText = null
     }
 
     val routerClient = remember {
@@ -236,6 +256,15 @@ fun RouterStudioApp() {
                         } else {
                             addLog("--- WLAN BASIC KEYS (${wifiConfig.rawBasicKeys.size}) ---", LogType.ACT)
                             wifiConfig.rawBasicKeys.forEach { (k, v) -> addLog("$k = $v", LogType.SYS) }
+                        }
+                    },
+                    onExportHtml = {
+                        runTask("Exporting all router HTML pages...") {
+                            val dump = routerClient.exportRouterHtmlDump()
+                            if (dump.isNotBlank()) {
+                                pendingExportText = dump
+                                exportLauncher.launch("zte_h108n_dump.txt")
+                            }
                         }
                     }
                 )
@@ -511,7 +540,6 @@ fun WifiControlTab(
             .padding(bottom = 100.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        // بطاقة تحديد سرعة الإنترنت (تقليل / تزويد)
         Box(modifier = Modifier.fillMaxWidth()) {
             StudioCard {
                 Row(
@@ -610,7 +638,6 @@ fun WifiControlTab(
             if (!isConnected) OverlayBlocker("Requires Connection")
         }
 
-        // بطاقة تغيير كلمة سر الواي فاي
         Box(modifier = Modifier.fillMaxWidth()) {
             StudioCard {
                 Text("Wi-Fi Security (Password)", color = TextMain, fontSize = 16.sp, fontWeight = FontWeight.Bold)
@@ -642,7 +669,6 @@ fun WifiControlTab(
             if (!isConnected) OverlayBlocker("Requires Connection")
         }
 
-        // بطاقة اسم الشبكة وإخفائها
         Box(modifier = Modifier.fillMaxWidth()) {
             StudioCard {
                 Text("Network Name (SSID)", color = TextMain, fontSize = 16.sp, fontWeight = FontWeight.Bold)
@@ -830,7 +856,8 @@ fun LogsTab(
     logs: List<TerminalEntry>,
     onClear: () -> Unit,
     onInspectDsl: () -> Unit,
-    onInspectWlan: () -> Unit
+    onInspectWlan: () -> Unit,
+    onExportHtml: () -> Unit
 ) {
     val listState = rememberLazyListState()
     LaunchedEffect(logs.size) {
@@ -848,6 +875,7 @@ fun LogsTab(
             StudioButton("WLAN Keys", Surface2, Modifier.weight(1f), onClick = onInspectWlan)
             StudioButton("Clear", Surface2, Modifier.weight(0.7f), onClick = onClear)
         }
+        StudioButton("Export Router HTML (.txt)", Accent, onClick = onExportHtml)
 
         Box(
             modifier = Modifier

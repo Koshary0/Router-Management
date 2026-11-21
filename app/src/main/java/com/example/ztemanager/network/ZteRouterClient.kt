@@ -90,13 +90,11 @@ class ZteRouterClient(
     private var baseUrl: String = "https://192.168.1.1"
     private var targetHost: String = "192.168.1.1"
 
-    // بيانات الجلسة لإعادة الدخول التلقائي عند انتهاء المهلة أو رفض صفحة
     private var savedIp: String = ""
     private var savedUser: String = ""
     private var savedPass: String = ""
     private var isRelogging: Boolean = false
 
-    // الصفحات المكتشفة فعلياً من قائمة الراوتر
     private val discoveredPages = linkedSetOf<String>()
     private var wlanBasicPage: String? = null
     private var wlanSsidPage: String? = null
@@ -315,7 +313,7 @@ class ZteRouterClient(
         }
     }
 
-    // ===================== 2. DSL TELEMETRY (UP/DOWN + INLINE SCRIPT PARSER) =====================
+    // ===================== 2. DSL TELEMETRY =====================
     suspend fun getDslStats(): DslStats = withContext(Dispatchers.IO) {
         try {
             onLog("FETCH -> status_dsl_info_t.gch", LogType.SYS)
@@ -401,7 +399,6 @@ class ZteRouterClient(
                 }
             }
 
-            // إذا لم تُقرأ قيم SNR أو Attenuation من الجدول، نبحث في أكواد الجافاسكربت للصفحة
             if (downSnr == "--" || downAttn == "--") {
                 val jsSnrUp = extractJsVar(html, "UpNoiseMargin", "UpstreamNoiseMargin", "Up_NoiseMargin", "snr_up", "UpSnr")
                 val jsSnrDown = extractJsVar(html, "DownNoiseMargin", "DownstreamNoiseMargin", "Down_NoiseMargin", "snr_down", "DownSnr")
@@ -413,7 +410,6 @@ class ZteRouterClient(
                 if (downAttn == "--" && jsAttnDown != null) downAttn = formatDb(jsAttnDown)
             }
 
-            // إضافة سطر تشخيصي مختصر عند الحاجة لمعرفة طريقة كتابة SNR في HTML
             if (downSnr == "--") {
                 Regex("""(?is)<tr[^>]*>.*?Noise Margin.*?</tr>""")
                     .find(html)?.value
@@ -770,12 +766,111 @@ class ZteRouterClient(
         }
     }
 
+    // ===================== 6. FULL HTML DIAGNOSTIC EXPORTER =====================
+    suspend fun exportRouterHtmlDump(): String = withContext(Dispatchers.IO) {
+        if (savedPass.isEmpty()) {
+            onLog("EXPORT: CONNECT TO ROUTER FIRST", LogType.WARN)
+            return@withContext ""
+        }
+
+        val sb = StringBuilder()
+
+        fun sanitize(html: String): String {
+            var s = html
+            val sensitiveKeys = listOf(
+                "KeyPassphrase", "PreSharedKey", "Password",
+                "UserName", "Username", "WPAPSK", "IPAddress"
+            )
+            for (k in sensitiveKeys) {
+                s = Regex(
+                    """(Transfer_meaning\(\s*['"]$k\d*['"]\s*,\s*['"])([^'"]*)(['"]\s*\))""",
+                    RegexOption.IGNORE_CASE
+                ).replace(s, "$1***REDACTED***$3")
+                s = Regex(
+                    """(name\s*=\s*["']$k\d*["'][^>]*value\s*=\s*["'])([^"']*)(["'])""",
+                    RegexOption.IGNORE_CASE
+                ).replace(s, "$1***REDACTED***$3")
+            }
+            return s
+        }
+
+        fun appendSection(title: String, content: String) {
+            sb.append("\n==================== $title (len=${content.length}) ====================\n")
+            sb.append(sanitize(content))
+            sb.append("\n")
+        }
+
+        try {
+            onLog("EXPORT: STARTING FRESH LOGIN...", LogType.SYS)
+            performLogin(silent = true)
+
+            val tpl = try {
+                client.newCall(Request.Builder().url("$baseUrl/template.gch").get().build())
+                    .execute().use { it.body?.string() ?: "" }
+            } catch (_: Exception) {
+                ""
+            }
+            collectMenuPages(tpl)
+            appendSection("template.gch", tpl)
+
+            val corePages = listOf(
+                "status_dsl_info_t.gch",
+                "status_wlan_info_t.gch",
+                "net_dhcp_dynamic_t.gch",
+                "IPv46_net_wan_conf_t.gch",
+                "sec_firewall_conf_t.gch",
+                "manager_dev_conf_t.gch"
+            )
+            for (p in corePages) {
+                onLog("EXPORT -> $p", LogType.SYS)
+                val html = rawGetPage(p)
+                if (!isSessionInvalid(html)) collectMenuPages(html)
+                appendSection(p, html)
+            }
+
+            appendSection("DISCOVERED_MENU_PAGES", discoveredPages.joinToString("\n"))
+
+            val extraPages = discoveredPages.filter { p ->
+                val low = p.lowercase(Locale.US)
+                p !in corePages && (
+                    low.contains("wlan") ||
+                        low.contains("wifi") ||
+                        low.contains("mac") ||
+                        low.contains("acl") ||
+                        low.contains("qos") ||
+                        low.contains("dhcp") ||
+                        low.contains("dsl") ||
+                        low.contains("dev_conf")
+                    )
+            }.take(12)
+
+            for (p in extraPages) {
+                onLog("EXPORT -> $p", LogType.ACT)
+                val html = rawGetPage(p)
+                appendSection(p, html)
+                if (isSessionInvalid(html)) {
+                    onLog("SESSION DROPPED ON $p -> RE-LOGIN", LogType.WARN)
+                    performLogin(silent = true)
+                }
+            }
+
+            onLog("EXPORT -> SECOND DHCP CHECK", LogType.SYS)
+            val dhcpSecond = rawGetPage("net_dhcp_dynamic_t.gch")
+            appendSection("SECOND_CALL_net_dhcp_dynamic_t.gch", dhcpSecond)
+
+            onLog("EXPORT READY (${sb.length / 1024} KB)", LogType.OK)
+            sb.toString()
+        } catch (e: Exception) {
+            onLog("EXPORT ERR: ${e.message}", LogType.ERR)
+            ""
+        }
+    }
+
     // ===================== MENU & PAGE RESOLUTION =====================
     private fun ensureMenuDiscovered() {
         if (discoveredPages.any { it.contains("wlan", ignoreCase = true) && it.startsWith("net_", ignoreCase = true) }) {
             return
         }
-        // قراءة القائمة الجانبية من صفحات نعلم يقيناً أنها موجودة في H108N V2.5
         listOf("status_wlan_info_t.gch", "IPv46_net_wan_conf_t.gch", "sec_firewall_conf_t.gch").forEach { seed ->
             val html = fetchPage(seed)
             if (html.isNotBlank()) collectMenuPages(html)
@@ -888,7 +983,6 @@ class ZteRouterClient(
                         collectMenuPages(retry)
                         return retry
                     }
-                    // الصفحة غير مدعومة في هذا الراوتر وأسقطت الجلسة، نعيد الجلسة للطلبات التالية
                     onLog("PAGE NOT SUPPORTED: $nextPage (RESTORING SESSION)", LogType.WARN)
                     performLogin(silent = true)
                 }
@@ -987,13 +1081,11 @@ class ZteRouterClient(
     private fun parseCellKeepingInlineScripts(cellHtml: String): String {
         val resolved = Regex("""(?is)<script[^>]*>(.*?)</script>""").replace(cellHtml) { match ->
             val script = match.groupValues[1]
-            // استخراج عمليات القسمة على 10 مثل parseInt("124")/10 أو 124/10
             val divMatch = Regex("""['"]?(-?\d+(?:\.\d+)?)['"]?\s*\)\s*/\s*10|(-?\d+(?:\.\d+)?)\s*/\s*10""").find(script)
             if (divMatch != null) {
                 val rawNum = (divMatch.groupValues[1].ifEmpty { divMatch.groupValues[2] }).toDoubleOrNull()
                 if (rawNum != null) return@replace String.format(Locale.US, "%.1f", rawNum / 10.0)
             }
-            // استخراج النصوص المكتوبة عبر document.write("...")
             val writeMatch = Regex("""document\.write\(\s*['"]([^'"]+)['"]\s*\)""").find(script)
             if (writeMatch != null) return@replace writeMatch.groupValues[1]
             ""
